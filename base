@@ -1,0 +1,1900 @@
+Claro. Esta versión ya incorpora ambos ajustes: TC vuelve a identificarse por PROCESO que contiene APROBACION CREDITOS TC y el cruce con Orgánico solo se considera válido cuando encuentra una MATRICULA real.
+
+# ============================================================
+# 1. IMPORTS
+# ============================================================
+from pathlib import Path
+from datetime import datetime
+import re
+import unicodedata
+import numpy as np
+import pandas as pd
+# ============================================================
+# 2. CONFIGURACIÓN DE RUTAS
+# ============================================================
+INPUT_FILE = Path(
+    r"D:\Datos de Usuarios\T72496\Desktop\PROYECTOS"
+    r"\SEGUIMIENTO_CENTRALIZADO\INPUT\INF_SOLICITUDES.csv"
+)
+ORGANICO_FILE = Path(
+    r"D:\Datos de Usuarios\T72496\Desktop\CENTRALIZADO_ETL"
+    r"\EXPORTS\ORGANICO\ORGANICO.csv"
+)
+OUTPUT_FILE = Path(
+    r"D:\Datos de Usuarios\T72496\OneDrive - Credicorp"
+    r"\SQUAD BACK OFFICE - General\SEGUIMIENTO_OPERACIONES"
+    r"\INPUT\INF_SOLICITUDES.csv"
+)
+# ============================================================
+# 3. CONSTANTES DE PROCESOS Y PASOS
+# ============================================================
+PROCESOS_CEF = {
+    "CO SOLICITUD APROBACIONES",
+    "CO SOLICITUD APROBACIONES TLMK",
+    "SFCP APROBACIONES EDUCATIVO",
+}
+TEXTO_PROCESO_TC = "APROBACION CREDITOS TC"
+PASO_ANALISTA_TC = "APROBACION DE CREDITOS ANALISTA"
+PASO_ANALISTA_CEF = "EVALUACION DE SOLICITUD"
+ESTADOS_FUERTES = {
+    "APROBADO",
+    "RECHAZADO",
+}
+ESTADO_RECUPERADA = "RECUPERADA"
+ORIGEN_ULTIMO_ACTOR = "ULTIMO_ACTOR"
+ORIGEN_ULTIMO_ACTOR_PASO = "ULTIMO_ACTOR_PASO"
+ORIGEN_SIN_COINCIDENCIA = "SIN_COINCIDENCIA_ORGANICO"
+# ============================================================
+# 4. COLUMNAS REQUERIDAS
+# ============================================================
+SOLICITUDES_REQUIRED_COLUMNS = [
+    "Nombre del registro",
+    "Paso: Nombre",
+    "Estado del paso",
+    "Fecha de inicio del paso",
+    "Fecha de finalización del paso",
+    "Nombre del paso pendiente",
+    "Proceso de aprobación: Nombre",
+    "Último actor: Nombre completo",
+    "Último actor del paso: Nombre completo",
+]
+SOLICITUDES_RENAME = {
+    "Nombre del registro": "NUMOPORTUNIDAD",
+    "Paso: Nombre": "NBRPASO",
+    "Estado del paso": "ESTADOSOLICITUDPASO",
+    "Fecha de inicio del paso": "FECINICIO_RAW",
+    "Fecha de finalización del paso": "FECFIN_RAW",
+    "Nombre del paso pendiente": "NBRPASOPENDIENTE",
+    "Proceso de aprobación: Nombre": "PROCESO",
+    "Último actor: Nombre completo": "NBRULTACTOR",
+    "Último actor del paso: Nombre completo": "NBRULTACTORPASO",
+}
+ORGANICO_REQUIRED_COLUMNS = [
+    "CODMES",
+    "NOMBRE_INFORME",
+    "MATRICULA",
+    "MATRICULA_SUPERIOR",
+    "NOMBRE_CORTO",
+    "NOMBRE_COMPLETO",
+    "UNIDAD_ORGANIZATIVA",
+    "CORREO_ELECTRONICO",
+    "CORREO_CLEAN",
+    "FECHA_INGRESO",
+    "FUENTE",
+]
+ORGANICO_USE_COLUMNS = [
+    "CODMES",
+    "NOMBRE_INFORME",
+    "MATRICULA",
+    "NOMBRE_COMPLETO",
+    "UNIDAD_ORGANIZATIVA",
+]
+# ============================================================
+# 5. COLUMNAS FINALES
+# ============================================================
+FINAL_COLUMNS = [
+    "NUMOPORTUNIDAD",
+    "CODMESEVALUACION",
+    "NOMBRE_COMPLETO",
+    "UNIDAD_ORGANIZATIVA",
+    "PROCESO",
+    "RESULTADOANALISTA",
+    "FLG_APROBADO",
+    "FLG_RECHAZADO",
+    "FLG_RECUPERADA",
+    "FLG_PENDIENTE",
+    "FLGSTATUSRECUPERADA",
+    "FH_LLEGA_ANALISTA",
+    "FH_FIN_ANALISTA",
+    "FH_ACTUALIZACION_ARCHIVO",
+]
+FLAG_COLUMNS = [
+    "FLG_APROBADO",
+    "FLG_RECHAZADO",
+    "FLG_RECUPERADA",
+    "FLG_PENDIENTE",
+    "FLGSTATUSRECUPERADA",
+]
+# ============================================================
+# 6. VALIDACIONES
+# ============================================================
+def require_file(file_path: Path) -> None:
+    """Valida que exista un archivo requerido."""
+    if not file_path.exists():
+        raise FileNotFoundError(
+            f"No se encontró el archivo requerido:\n{file_path}"
+        )
+    if not file_path.is_file():
+        raise FileNotFoundError(
+            f"La ruta existe, pero no corresponde a un archivo:\n"
+            f"{file_path}"
+        )
+def require_columns(
+    df: pd.DataFrame,
+    required_columns: list[str],
+    source_name: str,
+) -> None:
+    """Valida que existan todas las columnas requeridas."""
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in df.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            f"El archivo {source_name} no contiene todas las "
+            f"columnas requeridas.\n"
+            f"Columnas faltantes ({len(missing_columns)}):\n"
+            + "\n".join(
+                f"  - {column}"
+                for column in missing_columns
+            )
+        )
+# ============================================================
+# 7. HELPERS DE NORMALIZACIÓN
+# ============================================================
+def normalize_spaces(value: object) -> str:
+    """Limpia espacios iniciales, finales y repetidos."""
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text == "":
+        return ""
+    return re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+def remove_accents(value: object) -> str:
+    """Elimina tildes y signos diacríticos."""
+    text = normalize_spaces(value)
+    if text == "":
+        return ""
+    normalized = unicodedata.normalize(
+        "NFD",
+        text,
+    )
+    return "".join(
+        char
+        for char in normalized
+        if unicodedata.category(char) != "Mn"
+    )
+def limpiar_cesado(value: object) -> str:
+    """Elimina indicadores CESADO al final de un nombre."""
+    text = normalize_spaces(value)
+    if text == "":
+        return ""
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(
+            r"\s*-\s*CESADO\s*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"\s*\(\s*CESADO\s*\)\s*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"\s+CESADO\s*$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = normalize_spaces(text)
+    return text
+def norm_txt(
+    value: object,
+    clean_cesado: bool = False,
+) -> str:
+    """Normaliza texto para comparaciones y cruces."""
+    text = normalize_spaces(value)
+    if clean_cesado:
+        text = limpiar_cesado(text)
+    text = text.upper()
+    text = remove_accents(text)
+    text = normalize_spaces(text)
+    return text
+def norm_codmes(value: object) -> str:
+    """Normaliza CODMES conservando únicamente YYYYMM válido."""
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    digits = re.sub(
+        r"\D",
+        "",
+        text,
+    )
+    if not re.fullmatch(r"\d{6}", digits):
+        return ""
+    year = int(digits[:4])
+    month = int(digits[4:6])
+    if year < 1000:
+        return ""
+    if month < 1 or month > 12:
+        return ""
+    return digits
+# ============================================================
+# 8. HELPERS DE FECHAS
+# ============================================================
+def parse_fecha_hora_esp(series: pd.Series) -> pd.Series:
+    """Convierte fechas Salesforce en español a datetime."""
+    text = (
+        series
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    text = text.str.replace(
+        r"(?i)\ba\.\s*m\.\s*",
+        "AM",
+        regex=True,
+    )
+    text = text.str.replace(
+        r"(?i)\bp\.\s*m\.\s*",
+        "PM",
+        regex=True,
+    )
+    text = text.str.replace(
+        r"(?i)\ba\s*m\s*$",
+        "AM",
+        regex=True,
+    )
+    text = text.str.replace(
+        r"(?i)\bp\s*m\s*$",
+        "PM",
+        regex=True,
+    )
+    text = text.str.strip()
+    parsed = pd.to_datetime(
+        text,
+        format="%d/%m/%Y %I:%M %p",
+        errors="coerce",
+    )
+    failed_mask = (
+        parsed.isna()
+        & text.ne("")
+    )
+    if failed_mask.any():
+        fallback = pd.to_datetime(
+            text.loc[failed_mask],
+            dayfirst=True,
+            errors="coerce",
+        )
+        parsed.loc[failed_mask] = fallback
+    return parsed
+def codmes_from_timestamp(
+    series: pd.Series,
+) -> pd.Series:
+    """Obtiene YYYYMM desde una serie datetime."""
+    result = pd.Series(
+        "",
+        index=series.index,
+        dtype="string",
+    )
+    valid_mask = series.notna()
+    if valid_mask.any():
+        result.loc[valid_mask] = (
+            series.loc[valid_mask]
+            .dt.strftime("%Y%m")
+            .astype("string")
+        )
+    return result.fillna("")
+def format_timestamp_series(
+    series: pd.Series,
+) -> pd.Series:
+    """Formatea datetime como YYYY-MM-DD HH:MM:SS."""
+    result = pd.Series(
+        "",
+        index=series.index,
+        dtype="string",
+    )
+    valid_mask = series.notna()
+    if valid_mask.any():
+        result.loc[valid_mask] = (
+            series.loc[valid_mask]
+            .dt.strftime("%Y-%m-%d %H:%M:%S")
+            .astype("string")
+        )
+    return result.fillna("")
+# ============================================================
+# 9. CARGA DE INF_SOLICITUDES.csv
+# ============================================================
+def load_solicitudes(
+    file_path: Path,
+) -> pd.DataFrame:
+    """Carga y normaliza INF_SOLICITUDES.csv."""
+    require_file(file_path)
+    df = pd.read_csv(
+        file_path,
+        sep=",",
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+    require_columns(
+        df,
+        SOLICITUDES_REQUIRED_COLUMNS,
+        "INF_SOLICITUDES.csv",
+    )
+    df = df[
+        SOLICITUDES_REQUIRED_COLUMNS
+    ].copy()
+    df = df.rename(
+        columns=SOLICITUDES_RENAME
+    )
+    df["NUMOPORTUNIDAD"] = (
+        df["NUMOPORTUNIDAD"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    general_text_columns = [
+        "NBRPASO",
+        "ESTADOSOLICITUDPASO",
+        "NBRPASOPENDIENTE",
+        "PROCESO",
+    ]
+    for column in general_text_columns:
+        df[column] = df[column].map(
+            norm_txt
+        )
+    actor_columns = [
+        "NBRULTACTOR",
+        "NBRULTACTORPASO",
+    ]
+    for column in actor_columns:
+        df[column] = df[column].map(
+            lambda value: norm_txt(
+                value,
+                clean_cesado=True,
+            )
+        )
+    df["FECHORINICIOEVALUACION"] = (
+        parse_fecha_hora_esp(
+            df["FECINICIO_RAW"]
+        )
+    )
+    df["FECHORFINEVALUACION"] = (
+        parse_fecha_hora_esp(
+            df["FECFIN_RAW"]
+        )
+    )
+    df["TS_EVENTO"] = (
+        df["FECHORFINEVALUACION"]
+        .combine_first(
+            df["FECHORINICIOEVALUACION"]
+        )
+    )
+    return df
+# ============================================================
+# 10. CARGA DE ORGANICO.csv
+# ============================================================
+def load_organico(
+    file_path: Path,
+) -> pd.DataFrame:
+    """Carga, normaliza y valida ORGANICO.csv."""
+    require_file(file_path)
+    df = pd.read_csv(
+        file_path,
+        sep=";",
+        dtype=str,
+        keep_default_na=False,
+        encoding="utf-8-sig",
+    )
+    require_columns(
+        df,
+        ORGANICO_REQUIRED_COLUMNS,
+        "ORGANICO.csv",
+    )
+    df = df[
+        ORGANICO_USE_COLUMNS
+    ].copy()
+    df["CODMES"] = (
+        df["CODMES"]
+        .map(norm_codmes)
+    )
+    df["NOMBRE_INFORME"] = (
+        df["NOMBRE_INFORME"]
+        .map(
+            lambda value: norm_txt(
+                value,
+                clean_cesado=True,
+            )
+        )
+    )
+    df["MATRICULA"] = (
+        df["MATRICULA"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    # NOMBRE_COMPLETO y UNIDAD_ORGANIZATIVA
+    # mantienen su presentación original.
+    df["NOMBRE_COMPLETO"] = (
+        df["NOMBRE_COMPLETO"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    df["UNIDAD_ORGANIZATIVA"] = (
+        df["UNIDAD_ORGANIZATIVA"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    # Solo registros utilizables para una coincidencia real.
+    df = df.loc[
+        df["CODMES"].ne("")
+        & df["NOMBRE_INFORME"].ne("")
+        & df["MATRICULA"].ne("")
+    ].copy()
+    # --------------------------------------------------------
+    # VALIDACIÓN DE AMBIGÜEDAD
+    #
+    # CODMES + NOMBRE_INFORME no puede representar
+    # varias matrículas diferentes.
+    # --------------------------------------------------------
+    matriculas_per_name = (
+        df.groupby(
+            [
+                "CODMES",
+                "NOMBRE_INFORME",
+            ],
+            dropna=False,
+        )["MATRICULA"]
+        .nunique()
+        .reset_index(
+            name="CANT_MATRICULAS"
+        )
+    )
+    ambiguous = matriculas_per_name.loc[
+        matriculas_per_name[
+            "CANT_MATRICULAS"
+        ] > 1
+    ].copy()
+    if not ambiguous.empty:
+        examples = (
+            ambiguous[
+                [
+                    "CODMES",
+                    "NOMBRE_INFORME",
+                    "CANT_MATRICULAS",
+                ]
+            ]
+            .head(10)
+            .to_string(index=False)
+        )
+        raise ValueError(
+            "Se detectaron combinaciones ambiguas en "
+            "ORGANICO.csv.\n"
+            "Dentro de un mismo CODMES + NOMBRE_INFORME "
+            "existen varias matrículas distintas.\n"
+            f"Cantidad de casos ambiguos: "
+            f"{len(ambiguous):,}\n"
+            f"Primeros 10 ejemplos:\n{examples}"
+        )
+    df = df.drop_duplicates(
+        subset=[
+            "CODMES",
+            "NOMBRE_INFORME",
+        ],
+        keep="first",
+    ).copy()
+    return df.reset_index(drop=True)
+# ============================================================
+# 11. IDENTIFICACIÓN DEL PASO ANALISTA
+# ============================================================
+def is_tc(
+    df: pd.DataFrame,
+) -> pd.Series:
+    """Identifica procesos de Tarjeta de Crédito."""
+    return (
+        df["PROCESO"]
+        .fillna("")
+        .astype(str)
+        .str.contains(
+            TEXTO_PROCESO_TC,
+            regex=False,
+        )
+    )
+def is_cef(
+    df: pd.DataFrame,
+) -> pd.Series:
+    """Identifica procesos CEF."""
+    return df["PROCESO"].isin(
+        PROCESOS_CEF
+    )
+def es_paso_analista(
+    df: pd.DataFrame,
+) -> pd.Series:
+    """Identifica los pasos correspondientes al analista."""
+    paso_tc = (
+        df["NBRPASO"]
+        .eq(PASO_ANALISTA_TC)
+    )
+    paso_cef = (
+        df["NBRPASO"]
+        .eq(PASO_ANALISTA_CEF)
+    )
+    return (
+        (is_tc(df) & paso_tc)
+        | (is_cef(df) & paso_cef)
+    )
+# ============================================================
+# 12. ENRIQUECIMIENTO CONTRA ORGÁNICO
+# ============================================================
+def enrich_analista_con_organico(
+    snapshot: pd.DataFrame,
+    organico: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Enriquece el analista usando:
+    1. NBRULTACTOR.
+    2. NBRULTACTORPASO.
+    3. Sin coincidencia.
+    """
+    result = snapshot.copy()
+    organico_lookup = organico[
+        [
+            "CODMES",
+            "NOMBRE_INFORME",
+            "MATRICULA",
+            "NOMBRE_COMPLETO",
+            "UNIDAD_ORGANIZATIVA",
+        ]
+    ].copy()
+    # --------------------------------------------------------
+    # PRIMER CANDIDATO: NBRULTACTOR
+    # --------------------------------------------------------
+    org_actor = organico_lookup.rename(
+        columns={
+            "CODMES":
+                "CODMES_ORG_ACTOR",
+            "NOMBRE_INFORME":
+                "NOMBRE_INFORME_ACTOR",
+            "MATRICULA":
+                "MATRICULA_ACTOR",
+            "NOMBRE_COMPLETO":
+                "NOMBRE_COMPLETO_ACTOR",
+            "UNIDAD_ORGANIZATIVA":
+                "UNIDAD_ORGANIZATIVA_ACTOR",
+        }
+    )
+    result = result.merge(
+        org_actor,
+        how="left",
+        left_on=[
+            "CODMESEVALUACION",
+            "NBRULTACTOR",
+        ],
+        right_on=[
+            "CODMES_ORG_ACTOR",
+            "NOMBRE_INFORME_ACTOR",
+        ],
+        validate="many_to_one",
+    )
+    # --------------------------------------------------------
+    # SEGUNDO CANDIDATO: NBRULTACTORPASO
+    # --------------------------------------------------------
+    org_actor_paso = organico_lookup.rename(
+        columns={
+            "CODMES":
+                "CODMES_ORG_ACTOR_PASO",
+            "NOMBRE_INFORME":
+                "NOMBRE_INFORME_ACTOR_PASO",
+            "MATRICULA":
+                "MATRICULA_ACTOR_PASO",
+            "NOMBRE_COMPLETO":
+                "NOMBRE_COMPLETO_ACTOR_PASO",
+            "UNIDAD_ORGANIZATIVA":
+                "UNIDAD_ORGANIZATIVA_ACTOR_PASO",
+        }
+    )
+    result = result.merge(
+        org_actor_paso,
+        how="left",
+        left_on=[
+            "CODMESEVALUACION",
+            "NBRULTACTORPASO",
+        ],
+        right_on=[
+            "CODMES_ORG_ACTOR_PASO",
+            "NOMBRE_INFORME_ACTOR_PASO",
+        ],
+        validate="many_to_one",
+    )
+    # --------------------------------------------------------
+    # COINCIDENCIA REAL
+    #
+    # La existencia del nombre no es suficiente.
+    # Debe existir MATRICULA en Orgánico.
+    # --------------------------------------------------------
+    match_actor = (
+        result["MATRICULA_ACTOR"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .ne("")
+    )
+    match_actor_paso = (
+        result["MATRICULA_ACTOR_PASO"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .ne("")
+    )
+    # Primer candidato solamente si realmente encontró persona.
+    use_actor = match_actor
+    # El segundo candidato se intenta cuando el primero
+    # NO encontró coincidencia real.
+    use_actor_paso = (
+        ~match_actor
+        & match_actor_paso
+    )
+    result["NOMBRE_COMPLETO"] = np.select(
+        [
+            use_actor,
+            use_actor_paso,
+        ],
+        [
+            result["NOMBRE_COMPLETO_ACTOR"],
+            result["NOMBRE_COMPLETO_ACTOR_PASO"],
+        ],
+        default="",
+    )
+    result["UNIDAD_ORGANIZATIVA"] = np.select(
+        [
+            use_actor,
+            use_actor_paso,
+        ],
+        [
+            result["UNIDAD_ORGANIZATIVA_ACTOR"],
+            result["UNIDAD_ORGANIZATIVA_ACTOR_PASO"],
+        ],
+        default="",
+    )
+    result["ORIGEN_ANALISTA"] = np.select(
+        [
+            use_actor,
+            use_actor_paso,
+        ],
+        [
+            ORIGEN_ULTIMO_ACTOR,
+            ORIGEN_ULTIMO_ACTOR_PASO,
+        ],
+        default=ORIGEN_SIN_COINCIDENCIA,
+    )
+    result["NOMBRE_COMPLETO"] = (
+        pd.Series(
+            result["NOMBRE_COMPLETO"],
+            index=result.index,
+        )
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    result["UNIDAD_ORGANIZATIVA"] = (
+        pd.Series(
+            result["UNIDAD_ORGANIZATIVA"],
+            index=result.index,
+        )
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    result["ORIGEN_ANALISTA"] = (
+        pd.Series(
+            result["ORIGEN_ANALISTA"],
+            index=result.index,
+        )
+        .fillna(
+            ORIGEN_SIN_COINCIDENCIA
+        )
+        .astype(str)
+    )
+    # --------------------------------------------------------
+    # VALIDACIÓN DE CONSISTENCIA DEL ORGÁNICO
+    #
+    # Nombre y unidad deben proceder siempre del mismo
+    # candidato.
+    # --------------------------------------------------------
+    expected_name_actor = (
+        result["NOMBRE_COMPLETO_ACTOR"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    expected_unit_actor = (
+        result["UNIDAD_ORGANIZATIVA_ACTOR"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    expected_name_actor_paso = (
+        result["NOMBRE_COMPLETO_ACTOR_PASO"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    expected_unit_actor_paso = (
+        result["UNIDAD_ORGANIZATIVA_ACTOR_PASO"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    inconsistent_actor = (
+        use_actor
+        & (
+            result["NOMBRE_COMPLETO"].ne(
+                expected_name_actor
+            )
+            | result["UNIDAD_ORGANIZATIVA"].ne(
+                expected_unit_actor
+            )
+        )
+    )
+    inconsistent_actor_paso = (
+        use_actor_paso
+        & (
+            result["NOMBRE_COMPLETO"].ne(
+                expected_name_actor_paso
+            )
+            | result["UNIDAD_ORGANIZATIVA"].ne(
+                expected_unit_actor_paso
+            )
+        )
+    )
+    if (
+        inconsistent_actor.any()
+        or inconsistent_actor_paso.any()
+    ):
+        raise ValueError(
+            "Se detectó una inconsistencia al recuperar "
+            "NOMBRE_COMPLETO y UNIDAD_ORGANIZATIVA "
+            "desde ORGANICO.csv."
+        )
+    return result
+# ============================================================
+# 13. CONSTRUCCIÓN DEL SNAPSHOT
+# ============================================================
+def build_snapshot(
+    solicitudes: pd.DataFrame,
+    organico: pd.DataFrame,
+    fh_actualizacion_archivo: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Construye una fila por oportunidad evaluada por analista."""
+    mask_analista = es_paso_analista(
+        solicitudes
+    )
+    eventos = solicitudes.loc[
+        mask_analista
+    ].copy()
+    if eventos.empty:
+        empty_snapshot = pd.DataFrame(
+            columns=FINAL_COLUMNS
+        )
+        return (
+            empty_snapshot,
+            eventos,
+        )
+    # --------------------------------------------------------
+    # ORDEN DE EVENTOS
+    # --------------------------------------------------------
+    eventos = eventos.sort_values(
+        by=[
+            "NUMOPORTUNIDAD",
+            "TS_EVENTO",
+            "FECHORFINEVALUACION",
+            "FECHORINICIOEVALUACION",
+        ],
+        ascending=[
+            True,
+            False,
+            False,
+            False,
+        ],
+        na_position="last",
+        kind="stable",
+    ).copy()
+    expected_opportunities = (
+        eventos["NUMOPORTUNIDAD"]
+        .nunique(dropna=False)
+    )
+    # --------------------------------------------------------
+    # ÚLTIMO EVENTO DEL PASO ANALISTA
+    #
+    # Se utiliza para:
+    # - PROCESO
+    # - NBRULTACTOR
+    # - NBRULTACTORPASO
+    #
+    # NO se utiliza para determinar las fechas agregadas.
+    # --------------------------------------------------------
+    ultimo_evento = (
+        eventos
+        .drop_duplicates(
+            subset=[
+                "NUMOPORTUNIDAD",
+            ],
+            keep="first",
+        )[
+            [
+                "NUMOPORTUNIDAD",
+                "PROCESO",
+                "NBRULTACTOR",
+                "NBRULTACTORPASO",
+            ]
+        ]
+        .copy()
+    )
+    # --------------------------------------------------------
+    # FECHAS DEL ANALISTA
+    #
+    # Llegada = MIN(inicio)
+    # Fin     = MAX(fin)
+    # --------------------------------------------------------
+    fechas = (
+        eventos
+        .groupby(
+            "NUMOPORTUNIDAD",
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            FH_LLEGA_ANALISTA=(
+                "FECHORINICIOEVALUACION",
+                "min",
+            ),
+            FH_FIN_ANALISTA=(
+                "FECHORFINEVALUACION",
+                "max",
+            ),
+        )
+    )
+    # --------------------------------------------------------
+    # ÚLTIMO ESTADO FUERTE
+    # --------------------------------------------------------
+    eventos_fuertes = eventos.loc[
+        eventos[
+            "ESTADOSOLICITUDPASO"
+        ].isin(
+            ESTADOS_FUERTES
+        )
+    ].copy()
+    if eventos_fuertes.empty:
+        ultimo_fuerte = pd.DataFrame(
+            columns=[
+                "NUMOPORTUNIDAD",
+                "RESULTADO_FUERTE",
+            ]
+        )
+    else:
+        ultimo_fuerte = (
+            eventos_fuertes
+            .drop_duplicates(
+                subset=[
+                    "NUMOPORTUNIDAD",
+                ],
+                keep="first",
+            )[
+                [
+                    "NUMOPORTUNIDAD",
+                    "ESTADOSOLICITUDPASO",
+                ]
+            ]
+            .rename(
+                columns={
+                    "ESTADOSOLICITUDPASO":
+                        "RESULTADO_FUERTE",
+                }
+            )
+            .copy()
+        )
+    # --------------------------------------------------------
+    # HISTÓRICO RECUPERADA
+    # --------------------------------------------------------
+    recuperada_historica = (
+        eventos
+        .assign(
+            _ES_RECUPERADA=(
+                eventos[
+                    "ESTADOSOLICITUDPASO"
+                ].eq(
+                    ESTADO_RECUPERADA
+                )
+            )
+        )
+        .groupby(
+            "NUMOPORTUNIDAD",
+            as_index=False,
+            dropna=False,
+        )["_ES_RECUPERADA"]
+        .max()
+        .rename(
+            columns={
+                "_ES_RECUPERADA":
+                    "TUVO_RECUPERADA",
+            }
+        )
+    )
+    # --------------------------------------------------------
+    # CONSOLIDACIÓN 1 A 1
+    # --------------------------------------------------------
+    snapshot = ultimo_evento.merge(
+        fechas,
+        how="inner",
+        on="NUMOPORTUNIDAD",
+        validate="one_to_one",
+    )
+    snapshot = snapshot.merge(
+        ultimo_fuerte,
+        how="left",
+        on="NUMOPORTUNIDAD",
+        validate="one_to_one",
+    )
+    snapshot = snapshot.merge(
+        recuperada_historica,
+        how="left",
+        on="NUMOPORTUNIDAD",
+        validate="one_to_one",
+    )
+    snapshot["TUVO_RECUPERADA"] = (
+        snapshot["TUVO_RECUPERADA"]
+        .fillna(False)
+        .astype(bool)
+    )
+    # --------------------------------------------------------
+    # RESULTADO FINAL
+    # --------------------------------------------------------
+    tiene_estado_fuerte = (
+        snapshot["RESULTADO_FUERTE"]
+        .fillna("")
+        .astype(str)
+        .isin(
+            ESTADOS_FUERTES
+        )
+    )
+    snapshot["RESULTADOANALISTA"] = np.select(
+        [
+            tiene_estado_fuerte,
+            snapshot["TUVO_RECUPERADA"],
+        ],
+        [
+            snapshot[
+                "RESULTADO_FUERTE"
+            ].fillna(""),
+            ESTADO_RECUPERADA,
+        ],
+        default="PENDIENTE",
+    )
+    snapshot["RESULTADOANALISTA"] = (
+        pd.Series(
+            snapshot["RESULTADOANALISTA"],
+            index=snapshot.index,
+        )
+        .fillna("PENDIENTE")
+        .astype(str)
+    )
+    # --------------------------------------------------------
+    # FLAGS
+    # --------------------------------------------------------
+    snapshot["FLG_APROBADO"] = (
+        snapshot[
+            "RESULTADOANALISTA"
+        ]
+        .eq("APROBADO")
+        .astype("Int64")
+    )
+    snapshot["FLG_RECHAZADO"] = (
+        snapshot[
+            "RESULTADOANALISTA"
+        ]
+        .eq("RECHAZADO")
+        .astype("Int64")
+    )
+    snapshot["FLG_RECUPERADA"] = (
+        snapshot[
+            "RESULTADOANALISTA"
+        ]
+        .eq("RECUPERADA")
+        .astype("Int64")
+    )
+    snapshot["FLG_PENDIENTE"] = (
+        snapshot[
+            "RESULTADOANALISTA"
+        ]
+        .eq("PENDIENTE")
+        .astype("Int64")
+    )
+    snapshot["FLGSTATUSRECUPERADA"] = (
+        snapshot["TUVO_RECUPERADA"]
+        .astype("Int64")
+    )
+    # --------------------------------------------------------
+    # CODMESEVALUACION
+    #
+    # ÚNICAMENTE desde FH_LLEGA_ANALISTA.
+    # --------------------------------------------------------
+    snapshot["CODMESEVALUACION"] = (
+        codmes_from_timestamp(
+            snapshot[
+                "FH_LLEGA_ANALISTA"
+            ]
+        )
+    )
+    # --------------------------------------------------------
+    # ENRIQUECIMIENTO CON ORGÁNICO
+    # --------------------------------------------------------
+    snapshot = (
+        enrich_analista_con_organico(
+            snapshot=snapshot,
+            organico=organico,
+        )
+    )
+    # --------------------------------------------------------
+    # FECHA DE ACTUALIZACIÓN DEL ARCHIVO
+    # --------------------------------------------------------
+    snapshot[
+        "FH_ACTUALIZACION_ARCHIVO"
+    ] = fh_actualizacion_archivo
+    # --------------------------------------------------------
+    # VALIDACIÓN TEMPRANA DE CANTIDAD
+    # --------------------------------------------------------
+    if len(snapshot) != expected_opportunities:
+        raise ValueError(
+            "La cantidad de filas consolidadas no coincide "
+            "con la cantidad de oportunidades únicas del "
+            "paso analista.\n"
+            f"Oportunidades esperadas: "
+            f"{expected_opportunities:,}\n"
+            f"Filas consolidadas: "
+            f"{len(snapshot):,}"
+        )
+    return (
+        snapshot,
+        eventos,
+    )
+# ============================================================
+# 14. VALIDACIONES DEL RESULTADO
+# ============================================================
+def validate_snapshot(
+    snapshot: pd.DataFrame,
+    eventos_analista: pd.DataFrame,
+) -> None:
+    """Ejecuta validaciones finales de consistencia."""
+    if eventos_analista.empty:
+        if not snapshot.empty:
+            raise ValueError(
+                "No existen eventos del paso analista, "
+                "pero el snapshot contiene registros."
+            )
+        return
+    # --------------------------------------------------------
+    # 1. UNICIDAD
+    # --------------------------------------------------------
+    duplicated_mask = (
+        snapshot[
+            "NUMOPORTUNIDAD"
+        ]
+        .duplicated(
+            keep=False
+        )
+    )
+    if duplicated_mask.any():
+        duplicated_values = (
+            snapshot.loc[
+                duplicated_mask,
+                "NUMOPORTUNIDAD",
+            ]
+            .drop_duplicates()
+            .tolist()
+        )
+        raise ValueError(
+            "Se detectaron NUMOPORTUNIDAD duplicados "
+            "en el snapshot.\n"
+            f"Cantidad de oportunidades duplicadas: "
+            f"{len(duplicated_values):,}\n"
+            f"Primeros ejemplos: "
+            f"{duplicated_values[:10]}"
+        )
+    # --------------------------------------------------------
+    # 2. CANTIDAD ESPERADA
+    # --------------------------------------------------------
+    expected_count = (
+        eventos_analista[
+            "NUMOPORTUNIDAD"
+        ]
+        .nunique(
+            dropna=False
+        )
+    )
+    if len(snapshot) != expected_count:
+        raise ValueError(
+            "La cantidad final de filas no coincide "
+            "con las oportunidades únicas del paso "
+            "analista.\n"
+            f"Esperadas: {expected_count:,}\n"
+            f"Obtenidas: {len(snapshot):,}"
+        )
+    # --------------------------------------------------------
+    # 3. FLAGS MUTUAMENTE EXCLUYENTES
+    # --------------------------------------------------------
+    flag_sum = (
+        snapshot["FLG_APROBADO"]
+        + snapshot["FLG_RECHAZADO"]
+        + snapshot["FLG_RECUPERADA"]
+        + snapshot["FLG_PENDIENTE"]
+    )
+    invalid_flags = flag_sum.ne(1)
+    if invalid_flags.any():
+        examples = (
+            snapshot.loc[
+                invalid_flags,
+                [
+                    "NUMOPORTUNIDAD",
+                    "RESULTADOANALISTA",
+                    "FLG_APROBADO",
+                    "FLG_RECHAZADO",
+                    "FLG_RECUPERADA",
+                    "FLG_PENDIENTE",
+                ],
+            ]
+            .head(10)
+            .to_string(index=False)
+        )
+        raise ValueError(
+            "Los flags finales no son mutuamente "
+            "excluyentes.\n"
+            "La suma debe ser exactamente 1.\n"
+            f"Ejemplos:\n{examples}"
+        )
+    # --------------------------------------------------------
+    # 4. FLAG HISTÓRICO RECUPERADA
+    # --------------------------------------------------------
+    expected_recuperada = (
+        eventos_analista
+        .assign(
+            _RECUPERADA=(
+                eventos_analista[
+                    "ESTADOSOLICITUDPASO"
+                ].eq(
+                    ESTADO_RECUPERADA
+                )
+            )
+        )
+        .groupby(
+            "NUMOPORTUNIDAD",
+            dropna=False,
+        )["_RECUPERADA"]
+        .max()
+        .astype("Int64")
+    )
+    actual_recuperada = (
+        snapshot
+        .set_index(
+            "NUMOPORTUNIDAD"
+        )[
+            "FLGSTATUSRECUPERADA"
+        ]
+        .astype("Int64")
+    )
+    expected_recuperada = (
+        expected_recuperada
+        .reindex(
+            actual_recuperada.index
+        )
+    )
+    mismatch_recuperada = (
+        actual_recuperada
+        .ne(
+            expected_recuperada
+        )
+        .fillna(True)
+    )
+    if mismatch_recuperada.any():
+        affected = (
+            actual_recuperada
+            .index[
+                mismatch_recuperada
+            ]
+            .tolist()
+        )
+        raise ValueError(
+            "FLGSTATUSRECUPERADA no coincide con "
+            "el histórico real de RECUPERADA.\n"
+            f"Primeras oportunidades afectadas: "
+            f"{affected[:10]}"
+        )
+    # --------------------------------------------------------
+    # 5. FECHA DE FIN
+    # --------------------------------------------------------
+    expected_fin = (
+        eventos_analista
+        .groupby(
+            "NUMOPORTUNIDAD",
+            dropna=False,
+        )[
+            "FECHORFINEVALUACION"
+        ]
+        .max()
+    )
+    actual_fin = (
+        snapshot
+        .set_index(
+            "NUMOPORTUNIDAD"
+        )[
+            "FH_FIN_ANALISTA"
+        ]
+    )
+    expected_fin = (
+        expected_fin
+        .reindex(
+            actual_fin.index
+        )
+    )
+    same_fin = (
+        actual_fin.eq(
+            expected_fin
+        )
+        | (
+            actual_fin.isna()
+            & expected_fin.isna()
+        )
+    )
+    if not same_fin.all():
+        affected = (
+            actual_fin
+            .index[
+                ~same_fin
+            ]
+            .tolist()
+        )
+        raise ValueError(
+            "FH_FIN_ANALISTA no coincide con "
+            "MAX(FECHORFINEVALUACION).\n"
+            f"Primeras oportunidades afectadas: "
+            f"{affected[:10]}"
+        )
+    # --------------------------------------------------------
+    # 6. FECHA DE LLEGADA
+    # --------------------------------------------------------
+    expected_inicio = (
+        eventos_analista
+        .groupby(
+            "NUMOPORTUNIDAD",
+            dropna=False,
+        )[
+            "FECHORINICIOEVALUACION"
+        ]
+        .min()
+    )
+    actual_inicio = (
+        snapshot
+        .set_index(
+            "NUMOPORTUNIDAD"
+        )[
+            "FH_LLEGA_ANALISTA"
+        ]
+    )
+    expected_inicio = (
+        expected_inicio
+        .reindex(
+            actual_inicio.index
+        )
+    )
+    same_inicio = (
+        actual_inicio.eq(
+            expected_inicio
+        )
+        | (
+            actual_inicio.isna()
+            & expected_inicio.isna()
+        )
+    )
+    if not same_inicio.all():
+        affected = (
+            actual_inicio
+            .index[
+                ~same_inicio
+            ]
+            .tolist()
+        )
+        raise ValueError(
+            "FH_LLEGA_ANALISTA no coincide con "
+            "MIN(FECHORINICIOEVALUACION).\n"
+            f"Primeras oportunidades afectadas: "
+            f"{affected[:10]}"
+        )
+    # --------------------------------------------------------
+    # 7. CODMESEVALUACION
+    # --------------------------------------------------------
+    expected_codmes = (
+        codmes_from_timestamp(
+            snapshot[
+                "FH_LLEGA_ANALISTA"
+            ]
+        )
+        .fillna("")
+        .astype(str)
+    )
+    actual_codmes = (
+        snapshot[
+            "CODMESEVALUACION"
+        ]
+        .fillna("")
+        .astype(str)
+    )
+    invalid_codmes = (
+        actual_codmes.ne(
+            expected_codmes
+        )
+    )
+    if invalid_codmes.any():
+        examples = (
+            snapshot.loc[
+                invalid_codmes,
+                [
+                    "NUMOPORTUNIDAD",
+                    "FH_LLEGA_ANALISTA",
+                    "CODMESEVALUACION",
+                ],
+            ]
+            .head(10)
+            .to_string(index=False)
+        )
+        raise ValueError(
+            "CODMESEVALUACION no corresponde al "
+            "mes de FH_LLEGA_ANALISTA.\n"
+            f"Ejemplos:\n{examples}"
+        )
+    # --------------------------------------------------------
+    # 8. CONSISTENCIA ORGÁNICO
+    # --------------------------------------------------------
+    valid_origins = {
+        ORIGEN_ULTIMO_ACTOR,
+        ORIGEN_ULTIMO_ACTOR_PASO,
+        ORIGEN_SIN_COINCIDENCIA,
+    }
+    invalid_origin = (
+        ~snapshot[
+            "ORIGEN_ANALISTA"
+        ].isin(
+            valid_origins
+        )
+    )
+    if invalid_origin.any():
+        examples = (
+            snapshot.loc[
+                invalid_origin,
+                [
+                    "NUMOPORTUNIDAD",
+                    "ORIGEN_ANALISTA",
+                ],
+            ]
+            .head(10)
+            .to_string(index=False)
+        )
+        raise ValueError(
+            "Se detectaron valores inválidos en "
+            "ORIGEN_ANALISTA.\n"
+            f"Ejemplos:\n{examples}"
+        )
+    no_match = (
+        snapshot[
+            "ORIGEN_ANALISTA"
+        ].eq(
+            ORIGEN_SIN_COINCIDENCIA
+        )
+    )
+    invalid_no_match = (
+        no_match
+        & (
+            snapshot[
+                "NOMBRE_COMPLETO"
+            ]
+            .fillna("")
+            .ne("")
+            | snapshot[
+                "UNIDAD_ORGANIZATIVA"
+            ]
+            .fillna("")
+            .ne("")
+        )
+    )
+    if invalid_no_match.any():
+        examples = (
+            snapshot.loc[
+                invalid_no_match,
+                [
+                    "NUMOPORTUNIDAD",
+                    "NOMBRE_COMPLETO",
+                    "UNIDAD_ORGANIZATIVA",
+                    "ORIGEN_ANALISTA",
+                ],
+            ]
+            .head(10)
+            .to_string(index=False)
+        )
+        raise ValueError(
+            "Existen oportunidades sin coincidencia "
+            "de Orgánico que contienen información "
+            "de analista.\n"
+            f"Ejemplos:\n{examples}"
+        )
+    # --------------------------------------------------------
+    # RESULTADOS VÁLIDOS
+    # --------------------------------------------------------
+    valid_results = {
+        "APROBADO",
+        "RECHAZADO",
+        "RECUPERADA",
+        "PENDIENTE",
+    }
+    invalid_result = (
+        ~snapshot[
+            "RESULTADOANALISTA"
+        ].isin(
+            valid_results
+        )
+    )
+    if invalid_result.any():
+        examples = (
+            snapshot.loc[
+                invalid_result,
+                [
+                    "NUMOPORTUNIDAD",
+                    "RESULTADOANALISTA",
+                ],
+            ]
+            .head(10)
+            .to_string(index=False)
+        )
+        raise ValueError(
+            "Se detectaron RESULTADOANALISTA "
+            "inválidos.\n"
+            f"Ejemplos:\n{examples}"
+        )
+# ============================================================
+# 15. RESUMEN
+# ============================================================
+def show_summary(
+    input_rows: int,
+    organico_rows: int,
+    eventos_analista: pd.DataFrame,
+    snapshot: pd.DataFrame,
+    fh_actualizacion_archivo: str,
+) -> None:
+    """Muestra el resumen del procesamiento."""
+    cantidad_eventos = len(
+        eventos_analista
+    )
+    if eventos_analista.empty:
+        oportunidades_filtradas = 0
+    else:
+        oportunidades_filtradas = (
+            eventos_analista[
+                "NUMOPORTUNIDAD"
+            ]
+            .nunique(
+                dropna=False
+            )
+        )
+    oportunidades_finales = len(
+        snapshot
+    )
+    if snapshot.empty:
+        oportunidades_con_organico = 0
+        oportunidades_sin_organico = 0
+        cobertura = 0.0
+    else:
+        oportunidades_con_organico = int(
+            snapshot[
+                "ORIGEN_ANALISTA"
+            ]
+            .ne(
+                ORIGEN_SIN_COINCIDENCIA
+            )
+            .sum()
+        )
+        oportunidades_sin_organico = int(
+            snapshot[
+                "ORIGEN_ANALISTA"
+            ]
+            .eq(
+                ORIGEN_SIN_COINCIDENCIA
+            )
+            .sum()
+        )
+        cobertura = (
+            oportunidades_con_organico
+            / oportunidades_finales
+            * 100
+        )
+    print()
+    print("=" * 70)
+    print("RESUMEN DE EJECUCIÓN")
+    print("=" * 70)
+    print(
+        f"FH_ACTUALIZACION_ARCHIVO        : "
+        f"{fh_actualizacion_archivo}"
+    )
+    print(
+        f"Filas leídas INF_SOLICITUDES    : "
+        f"{input_rows:,}"
+    )
+    print(
+        f"Filas válidas ORGANICO           : "
+        f"{organico_rows:,}"
+    )
+    print(
+        f"Eventos del paso analista        : "
+        f"{cantidad_eventos:,}"
+    )
+    print(
+        f"Oportunidades únicas filtradas   : "
+        f"{oportunidades_filtradas:,}"
+    )
+    print(
+        f"Oportunidades finales            : "
+        f"{oportunidades_finales:,}"
+    )
+    print(
+        f"Con coincidencia en Orgánico     : "
+        f"{oportunidades_con_organico:,}"
+    )
+    print(
+        f"Sin coincidencia en Orgánico     : "
+        f"{oportunidades_sin_organico:,}"
+    )
+    print(
+        f"Cobertura de Orgánico            : "
+        f"{cobertura:.2f}%"
+    )
+    print()
+    print("RESULTADOANALISTA")
+    print("-" * 70)
+    result_order = [
+        "APROBADO",
+        "RECHAZADO",
+        "RECUPERADA",
+        "PENDIENTE",
+    ]
+    if snapshot.empty:
+        result_counts = pd.Series(
+            dtype="int64"
+        )
+    else:
+        result_counts = (
+            snapshot[
+                "RESULTADOANALISTA"
+            ]
+            .value_counts(
+                dropna=False
+            )
+        )
+    for result in result_order:
+        count = int(
+            result_counts.get(
+                result,
+                0,
+            )
+        )
+        print(
+            f"{result:<30}: "
+            f"{count:,}"
+        )
+    print()
+    print("ORIGEN_ANALISTA")
+    print("-" * 70)
+    origin_order = [
+        ORIGEN_ULTIMO_ACTOR,
+        ORIGEN_ULTIMO_ACTOR_PASO,
+        ORIGEN_SIN_COINCIDENCIA,
+    ]
+    if snapshot.empty:
+        origin_counts = pd.Series(
+            dtype="int64"
+        )
+    else:
+        origin_counts = (
+            snapshot[
+                "ORIGEN_ANALISTA"
+            ]
+            .value_counts(
+                dropna=False
+            )
+        )
+    for origin in origin_order:
+        count = int(
+            origin_counts.get(
+                origin,
+                0,
+            )
+        )
+        print(
+            f"{origin:<30}: "
+            f"{count:,}"
+        )
+    print("=" * 70)
+    print()
+# ============================================================
+# 16. EXPORTACIÓN
+# ============================================================
+def export_output(
+    snapshot: pd.DataFrame,
+    output_file: Path,
+) -> int:
+    """Prepara y exporta el CSV final."""
+    output_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+    if snapshot.empty:
+        output = pd.DataFrame(
+            columns=FINAL_COLUMNS
+        )
+    else:
+        output = snapshot.copy()
+        # ----------------------------------------------------
+        # FORMATO FINAL DE FECHAS
+        # ----------------------------------------------------
+        output[
+            "FH_LLEGA_ANALISTA"
+        ] = format_timestamp_series(
+            output[
+                "FH_LLEGA_ANALISTA"
+            ]
+        )
+        output[
+            "FH_FIN_ANALISTA"
+        ] = format_timestamp_series(
+            output[
+                "FH_FIN_ANALISTA"
+            ]
+        )
+        # ----------------------------------------------------
+        # FLAGS COMO Int64
+        # ----------------------------------------------------
+        for column in FLAG_COLUMNS:
+            output[column] = (
+                output[column]
+                .astype("Int64")
+            )
+        # ----------------------------------------------------
+        # COLUMNAS DE TEXTO
+        # ----------------------------------------------------
+        text_columns = [
+            "NUMOPORTUNIDAD",
+            "CODMESEVALUACION",
+            "NOMBRE_COMPLETO",
+            "UNIDAD_ORGANIZATIVA",
+            "PROCESO",
+            "RESULTADOANALISTA",
+            "FH_LLEGA_ANALISTA",
+            "FH_FIN_ANALISTA",
+            "FH_ACTUALIZACION_ARCHIVO",
+        ]
+        for column in text_columns:
+            output[column] = (
+                output[column]
+                .fillna("")
+                .astype(str)
+            )
+        # ----------------------------------------------------
+        # SELECCIÓN EXPLÍCITA DE LAS 14 COLUMNAS
+        # ----------------------------------------------------
+        output = output[
+            FINAL_COLUMNS
+        ].copy()
+    if list(output.columns) != FINAL_COLUMNS:
+        raise ValueError(
+            "Las columnas finales no coinciden "
+            "exactamente con la estructura requerida.\n"
+            f"Esperadas: {FINAL_COLUMNS}\n"
+            f"Obtenidas: {list(output.columns)}"
+        )
+    output.to_csv(
+        output_file,
+        sep=";",
+        index=False,
+        encoding="utf-8-sig",
+        na_rep="",
+    )
+    return len(output)
+# ============================================================
+# 17. RUN
+# ============================================================
+def run() -> None:
+    """Ejecuta el seguimiento diario de producción."""
+    print()
+    print("=" * 70)
+    print(
+        "INICIO - SEGUIMIENTO DIARIO DE PRODUCCIÓN DE ANALISTAS"
+    )
+    print("=" * 70)
+    print()
+    # --------------------------------------------------------
+    # VALIDACIÓN DE ARCHIVOS
+    # --------------------------------------------------------
+    require_file(
+        INPUT_FILE
+    )
+    require_file(
+        ORGANICO_FILE
+    )
+    # --------------------------------------------------------
+    # FH_ACTUALIZACION_ARCHIVO
+    # --------------------------------------------------------
+    input_mtime = (
+        INPUT_FILE
+        .stat()
+        .st_mtime
+    )
+    fh_actualizacion_archivo = (
+        datetime.fromtimestamp(
+            input_mtime
+        )
+        .strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    )
+    print(
+        "FH_ACTUALIZACION_ARCHIVO: "
+        f"{fh_actualizacion_archivo}"
+    )
+    # --------------------------------------------------------
+    # INF_SOLICITUDES
+    # --------------------------------------------------------
+    print()
+    print(
+        "Leyendo INF_SOLICITUDES.csv..."
+    )
+    solicitudes = load_solicitudes(
+        INPUT_FILE
+    )
+    input_rows = len(
+        solicitudes
+    )
+    print(
+        "Filas leídas de INF_SOLICITUDES.csv: "
+        f"{input_rows:,}"
+    )
+    # --------------------------------------------------------
+    # ORGANICO
+    # --------------------------------------------------------
+    print()
+    print(
+        "Leyendo ORGANICO.csv..."
+    )
+    organico = load_organico(
+        ORGANICO_FILE
+    )
+    organico_rows = len(
+        organico
+    )
+    print(
+        "Filas válidas de ORGANICO.csv: "
+        f"{organico_rows:,}"
+    )
+    # --------------------------------------------------------
+    # SNAPSHOT
+    # --------------------------------------------------------
+    print()
+    print(
+        "Identificando eventos del paso analista..."
+    )
+    snapshot, eventos_analista = (
+        build_snapshot(
+            solicitudes=solicitudes,
+            organico=organico,
+            fh_actualizacion_archivo=(
+                fh_actualizacion_archivo
+            ),
+        )
+    )
+    cantidad_eventos = len(
+        eventos_analista
+    )
+    if eventos_analista.empty:
+        oportunidades_filtradas = 0
+    else:
+        oportunidades_filtradas = (
+            eventos_analista[
+                "NUMOPORTUNIDAD"
+            ]
+            .nunique(
+                dropna=False
+            )
+        )
+    print(
+        "Eventos identificados como paso analista: "
+        f"{cantidad_eventos:,}"
+    )
+    print(
+        "Oportunidades únicas después del filtro: "
+        f"{oportunidades_filtradas:,}"
+    )
+    # --------------------------------------------------------
+    # VALIDACIONES
+    # --------------------------------------------------------
+    print()
+    print(
+        "Ejecutando validaciones de consistencia..."
+    )
+    validate_snapshot(
+        snapshot=snapshot,
+        eventos_analista=eventos_analista,
+    )
+    print(
+        "Validaciones completadas correctamente."
+    )
+    # --------------------------------------------------------
+    # RESUMEN
+    # --------------------------------------------------------
+    show_summary(
+        input_rows=input_rows,
+        organico_rows=organico_rows,
+        eventos_analista=eventos_analista,
+        snapshot=snapshot,
+        fh_actualizacion_archivo=(
+            fh_actualizacion_archivo
+        ),
+    )
+    # --------------------------------------------------------
+    # EXPORTACIÓN
+    # --------------------------------------------------------
+    print(
+        "Exportando resultado..."
+    )
+    row_count = export_output(
+        snapshot=snapshot,
+        output_file=OUTPUT_FILE,
+    )
+    print()
+    print(
+        "Archivo generado:"
+    )
+    print(
+        OUTPUT_FILE
+    )
+    print(
+        "Cantidad de filas exportadas: "
+        f"{row_count:,}"
+    )
+    print()
+    print("=" * 70)
+    print(
+        "PROCESO FINALIZADO CORRECTAMENTE"
+    )
+    print("=" * 70)
+    print()
+# ============================================================
+# 18. EJECUCIÓN
+# ============================================================
+if __name__ == "__main__":
+    run()
