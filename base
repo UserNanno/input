@@ -1,51 +1,113 @@
-Claro. Esta versión ya incorpora ambos ajustes: TC vuelve a identificarse por PROCESO que contiene APROBACION CREDITOS TC y el cruce con Orgánico solo se considera válido cuando encuentra una MATRICULA real.
-
 # ============================================================
 # 1. IMPORTS
 # ============================================================
 from pathlib import Path
 from datetime import datetime
+import logging
+import os
 import re
+import shutil
+import time
 import unicodedata
+
 import numpy as np
 import pandas as pd
+import pythoncom
+import win32com.client
+
+
 # ============================================================
 # 2. CONFIGURACIÓN DE RUTAS
 # ============================================================
+BASE_DIR = Path(__file__).resolve().parent
+
 INPUT_FILE = Path(
     r"D:\Datos de Usuarios\T72496\Desktop\PROYECTOS"
-    r"\SEGUIMIENTO_CENTRALIZADO\INPUT\INF_SOLICITUDES.csv"
+    r"\SEGUIMIENTO_DESEMPEÑO_ANALISTAS\INPUT\INF_SOLICITUDES.csv"
 )
+
 ORGANICO_FILE = Path(
     r"D:\Datos de Usuarios\T72496\Desktop\CENTRALIZADO_ETL"
     r"\EXPORTS\ORGANICO\ORGANICO.csv"
 )
+
 OUTPUT_FILE = Path(
     r"D:\Datos de Usuarios\T72496\OneDrive - Credicorp"
     r"\SQUAD BACK OFFICE - General\SEGUIMIENTO_OPERACIONES"
     r"\INPUT\INF_SOLICITUDES.csv"
 )
+
+EXCEL_FILE = Path(
+    r"D:\Datos de Usuarios\T72496\OneDrive - Credicorp"
+    r"\SQUAD BACK OFFICE - General\SEGUIMIENTO_OPERACIONES"
+    r"\SEGUIMIENTO_DESEMPEÑO.xlsx"
+)
+
+ARCHIVE_DIR = BASE_DIR / "archive"
+LOG_DIR = BASE_DIR / "logs"
+LOG_FILE = LOG_DIR / "seguimiento_desempeno.log"
+
+
 # ============================================================
-# 3. CONSTANTES DE PROCESOS Y PASOS
+# 3. CONFIGURACIÓN DEL WATCHER / EXCEL
+# ============================================================
+CHECK_INTERVAL_SECONDS = 15
+FILE_STABLE_SECONDS = 5
+FILE_READY_MAX_ATTEMPTS = 60
+
+EXCEL_OPEN_RETRIES = 3
+EXCEL_OPEN_RETRY_SECONDS = 10
+EXCEL_POST_REFRESH_WAIT_SECONDS = 3
+
+ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# 4. LOGGING
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(
+            LOG_FILE,
+            encoding="utf-8",
+        ),
+        logging.StreamHandler(),
+    ],
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 5. CONSTANTES DE PROCESOS Y PASOS
 # ============================================================
 PROCESOS_CEF = {
     "CO SOLICITUD APROBACIONES",
     "CO SOLICITUD APROBACIONES TLMK",
     "SFCP APROBACIONES EDUCATIVO",
 }
+
 TEXTO_PROCESO_TC = "APROBACION CREDITOS TC"
 PASO_ANALISTA_TC = "APROBACION DE CREDITOS ANALISTA"
 PASO_ANALISTA_CEF = "EVALUACION DE SOLICITUD"
+
 ESTADOS_FUERTES = {
     "APROBADO",
     "RECHAZADO",
 }
+
 ESTADO_RECUPERADA = "RECUPERADA"
+
 ORIGEN_ULTIMO_ACTOR = "ULTIMO_ACTOR"
 ORIGEN_ULTIMO_ACTOR_PASO = "ULTIMO_ACTOR_PASO"
 ORIGEN_SIN_COINCIDENCIA = "SIN_COINCIDENCIA_ORGANICO"
+
+
 # ============================================================
-# 4. COLUMNAS REQUERIDAS
+# 6. COLUMNAS REQUERIDAS
 # ============================================================
 SOLICITUDES_REQUIRED_COLUMNS = [
     "Nombre del registro",
@@ -58,6 +120,7 @@ SOLICITUDES_REQUIRED_COLUMNS = [
     "Último actor: Nombre completo",
     "Último actor del paso: Nombre completo",
 ]
+
 SOLICITUDES_RENAME = {
     "Nombre del registro": "NUMOPORTUNIDAD",
     "Paso: Nombre": "NBRPASO",
@@ -69,6 +132,7 @@ SOLICITUDES_RENAME = {
     "Último actor: Nombre completo": "NBRULTACTOR",
     "Último actor del paso: Nombre completo": "NBRULTACTORPASO",
 }
+
 ORGANICO_REQUIRED_COLUMNS = [
     "CODMES",
     "NOMBRE_INFORME",
@@ -82,6 +146,7 @@ ORGANICO_REQUIRED_COLUMNS = [
     "FECHA_INGRESO",
     "FUENTE",
 ]
+
 ORGANICO_USE_COLUMNS = [
     "CODMES",
     "NOMBRE_INFORME",
@@ -89,8 +154,10 @@ ORGANICO_USE_COLUMNS = [
     "NOMBRE_COMPLETO",
     "UNIDAD_ORGANIZATIVA",
 ]
+
+
 # ============================================================
-# 5. COLUMNAS FINALES
+# 7. COLUMNAS FINALES
 # ============================================================
 FINAL_COLUMNS = [
     "NUMOPORTUNIDAD",
@@ -108,6 +175,7 @@ FINAL_COLUMNS = [
     "FH_FIN_ANALISTA",
     "FH_ACTUALIZACION_ARCHIVO",
 ]
+
 FLAG_COLUMNS = [
     "FLG_APROBADO",
     "FLG_RECHAZADO",
@@ -115,8 +183,10 @@ FLAG_COLUMNS = [
     "FLG_PENDIENTE",
     "FLGSTATUSRECUPERADA",
 ]
+
+
 # ============================================================
-# 6. VALIDACIONES
+# 8. VALIDACIONES
 # ============================================================
 def require_file(file_path: Path) -> None:
     """Valida que exista un archivo requerido."""
@@ -124,11 +194,14 @@ def require_file(file_path: Path) -> None:
         raise FileNotFoundError(
             f"No se encontró el archivo requerido:\n{file_path}"
         )
+
     if not file_path.is_file():
         raise FileNotFoundError(
             f"La ruta existe, pero no corresponde a un archivo:\n"
             f"{file_path}"
         )
+
+
 def require_columns(
     df: pd.DataFrame,
     required_columns: list[str],
@@ -140,6 +213,7 @@ def require_columns(
         for column in required_columns
         if column not in df.columns
     ]
+
     if missing_columns:
         raise ValueError(
             f"El archivo {source_name} no contiene todas las "
@@ -150,96 +224,132 @@ def require_columns(
                 for column in missing_columns
             )
         )
+
+
 # ============================================================
-# 7. HELPERS DE NORMALIZACIÓN
+# 9. HELPERS DE NORMALIZACIÓN
 # ============================================================
 def normalize_spaces(value: object) -> str:
     """Limpia espacios iniciales, finales y repetidos."""
     if value is None or pd.isna(value):
         return ""
+
     text = str(value).strip()
+
     if text == "":
         return ""
+
     return re.sub(
         r"\s+",
         " ",
         text,
     )
+
+
 def remove_accents(value: object) -> str:
     """Elimina tildes y signos diacríticos."""
     text = normalize_spaces(value)
+
     if text == "":
         return ""
+
     normalized = unicodedata.normalize(
         "NFD",
         text,
     )
+
     return "".join(
         char
         for char in normalized
         if unicodedata.category(char) != "Mn"
     )
+
+
 def limpiar_cesado(value: object) -> str:
     """Elimina indicadores CESADO al final de un nombre."""
     text = normalize_spaces(value)
+
     if text == "":
         return ""
+
     previous = None
+
     while previous != text:
         previous = text
+
         text = re.sub(
             r"\s*-\s*CESADO\s*$",
             "",
             text,
             flags=re.IGNORECASE,
         )
+
         text = re.sub(
             r"\s*\(\s*CESADO\s*\)\s*$",
             "",
             text,
             flags=re.IGNORECASE,
         )
+
         text = re.sub(
             r"\s+CESADO\s*$",
             "",
             text,
             flags=re.IGNORECASE,
         )
+
         text = normalize_spaces(text)
+
     return text
+
+
 def norm_txt(
     value: object,
     clean_cesado: bool = False,
 ) -> str:
     """Normaliza texto para comparaciones y cruces."""
     text = normalize_spaces(value)
+
     if clean_cesado:
         text = limpiar_cesado(text)
+
     text = text.upper()
     text = remove_accents(text)
     text = normalize_spaces(text)
+
     return text
+
+
 def norm_codmes(value: object) -> str:
     """Normaliza CODMES conservando únicamente YYYYMM válido."""
     if value is None or pd.isna(value):
         return ""
+
     text = str(value).strip()
+
     digits = re.sub(
         r"\D",
         "",
         text,
     )
+
     if not re.fullmatch(r"\d{6}", digits):
         return ""
+
     year = int(digits[:4])
     month = int(digits[4:6])
+
     if year < 1000:
         return ""
+
     if month < 1 or month > 12:
         return ""
+
     return digits
+
+
 # ============================================================
-# 8. HELPERS DE FECHAS
+# 10. HELPERS DE FECHAS
 # ============================================================
 def parse_fecha_hora_esp(series: pd.Series) -> pd.Series:
     """Convierte fechas Salesforce en español a datetime."""
@@ -249,44 +359,56 @@ def parse_fecha_hora_esp(series: pd.Series) -> pd.Series:
         .astype(str)
         .str.strip()
     )
+
     text = text.str.replace(
         r"(?i)\ba\.\s*m\.\s*",
         "AM",
         regex=True,
     )
+
     text = text.str.replace(
         r"(?i)\bp\.\s*m\.\s*",
         "PM",
         regex=True,
     )
+
     text = text.str.replace(
         r"(?i)\ba\s*m\s*$",
         "AM",
         regex=True,
     )
+
     text = text.str.replace(
         r"(?i)\bp\s*m\s*$",
         "PM",
         regex=True,
     )
+
     text = text.str.strip()
+
     parsed = pd.to_datetime(
         text,
         format="%d/%m/%Y %I:%M %p",
         errors="coerce",
     )
+
     failed_mask = (
         parsed.isna()
         & text.ne("")
     )
+
     if failed_mask.any():
         fallback = pd.to_datetime(
             text.loc[failed_mask],
             dayfirst=True,
             errors="coerce",
         )
+
         parsed.loc[failed_mask] = fallback
+
     return parsed
+
+
 def codmes_from_timestamp(
     series: pd.Series,
 ) -> pd.Series:
@@ -296,14 +418,19 @@ def codmes_from_timestamp(
         index=series.index,
         dtype="string",
     )
+
     valid_mask = series.notna()
+
     if valid_mask.any():
         result.loc[valid_mask] = (
             series.loc[valid_mask]
             .dt.strftime("%Y%m")
             .astype("string")
         )
+
     return result.fillna("")
+
+
 def format_timestamp_series(
     series: pd.Series,
 ) -> pd.Series:
@@ -313,60 +440,74 @@ def format_timestamp_series(
         index=series.index,
         dtype="string",
     )
+
     valid_mask = series.notna()
+
     if valid_mask.any():
         result.loc[valid_mask] = (
             series.loc[valid_mask]
             .dt.strftime("%Y-%m-%d %H:%M:%S")
             .astype("string")
         )
+
     return result.fillna("")
+
+
 # ============================================================
-# 9. CARGA DE INF_SOLICITUDES.csv
+# 11. CARGA DE INF_SOLICITUDES.csv
 # ============================================================
 def load_solicitudes(
     file_path: Path,
 ) -> pd.DataFrame:
     """Carga y normaliza INF_SOLICITUDES.csv."""
     require_file(file_path)
+
     df = pd.read_csv(
         file_path,
         sep=",",
         dtype=str,
         keep_default_na=False,
-        encoding="utf-8-sig",
+        encoding="cp1252",
     )
+
     require_columns(
         df,
         SOLICITUDES_REQUIRED_COLUMNS,
         "INF_SOLICITUDES.csv",
     )
+
     df = df[
         SOLICITUDES_REQUIRED_COLUMNS
     ].copy()
+
     df = df.rename(
         columns=SOLICITUDES_RENAME
     )
+
     df["NUMOPORTUNIDAD"] = (
         df["NUMOPORTUNIDAD"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
+
     general_text_columns = [
         "NBRPASO",
         "ESTADOSOLICITUDPASO",
         "NBRPASOPENDIENTE",
         "PROCESO",
     ]
+
     for column in general_text_columns:
         df[column] = df[column].map(
             norm_txt
         )
+
     actor_columns = [
         "NBRULTACTOR",
         "NBRULTACTORPASO",
     ]
+
     for column in actor_columns:
         df[column] = df[column].map(
             lambda value: norm_txt(
@@ -374,31 +515,38 @@ def load_solicitudes(
                 clean_cesado=True,
             )
         )
+
     df["FECHORINICIOEVALUACION"] = (
         parse_fecha_hora_esp(
             df["FECINICIO_RAW"]
         )
     )
+
     df["FECHORFINEVALUACION"] = (
         parse_fecha_hora_esp(
             df["FECFIN_RAW"]
         )
     )
+
     df["TS_EVENTO"] = (
         df["FECHORFINEVALUACION"]
         .combine_first(
             df["FECHORINICIOEVALUACION"]
         )
     )
+
     return df
+
+
 # ============================================================
-# 10. CARGA DE ORGANICO.csv
+# 12. CARGA DE ORGANICO.csv
 # ============================================================
 def load_organico(
     file_path: Path,
 ) -> pd.DataFrame:
     """Carga, normaliza y valida ORGANICO.csv."""
     require_file(file_path)
+
     df = pd.read_csv(
         file_path,
         sep=";",
@@ -406,18 +554,22 @@ def load_organico(
         keep_default_na=False,
         encoding="utf-8-sig",
     )
+
     require_columns(
         df,
         ORGANICO_REQUIRED_COLUMNS,
         "ORGANICO.csv",
     )
+
     df = df[
         ORGANICO_USE_COLUMNS
     ].copy()
+
     df["CODMES"] = (
         df["CODMES"]
         .map(norm_codmes)
     )
+
     df["NOMBRE_INFORME"] = (
         df["NOMBRE_INFORME"]
         .map(
@@ -427,38 +579,34 @@ def load_organico(
             )
         )
     )
+
     df["MATRICULA"] = (
         df["MATRICULA"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
-    # NOMBRE_COMPLETO y UNIDAD_ORGANIZATIVA
-    # mantienen su presentación original.
+
     df["NOMBRE_COMPLETO"] = (
         df["NOMBRE_COMPLETO"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
+
     df["UNIDAD_ORGANIZATIVA"] = (
         df["UNIDAD_ORGANIZATIVA"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
-    # Solo registros utilizables para una coincidencia real.
+
     df = df.loc[
         df["CODMES"].ne("")
         & df["NOMBRE_INFORME"].ne("")
         & df["MATRICULA"].ne("")
     ].copy()
-    # --------------------------------------------------------
-    # VALIDACIÓN DE AMBIGÜEDAD
-    #
-    # CODMES + NOMBRE_INFORME no puede representar
-    # varias matrículas diferentes.
-    # --------------------------------------------------------
+
     matriculas_per_name = (
         df.groupby(
             [
@@ -472,11 +620,13 @@ def load_organico(
             name="CANT_MATRICULAS"
         )
     )
+
     ambiguous = matriculas_per_name.loc[
         matriculas_per_name[
             "CANT_MATRICULAS"
         ] > 1
     ].copy()
+
     if not ambiguous.empty:
         examples = (
             ambiguous[
@@ -489,6 +639,7 @@ def load_organico(
             .head(10)
             .to_string(index=False)
         )
+
         raise ValueError(
             "Se detectaron combinaciones ambiguas en "
             "ORGANICO.csv.\n"
@@ -498,6 +649,7 @@ def load_organico(
             f"{len(ambiguous):,}\n"
             f"Primeros 10 ejemplos:\n{examples}"
         )
+
     df = df.drop_duplicates(
         subset=[
             "CODMES",
@@ -505,9 +657,12 @@ def load_organico(
         ],
         keep="first",
     ).copy()
+
     return df.reset_index(drop=True)
+
+
 # ============================================================
-# 11. IDENTIFICACIÓN DEL PASO ANALISTA
+# 13. IDENTIFICACIÓN DEL PASO ANALISTA
 # ============================================================
 def is_tc(
     df: pd.DataFrame,
@@ -522,6 +677,8 @@ def is_tc(
             regex=False,
         )
     )
+
+
 def is_cef(
     df: pd.DataFrame,
 ) -> pd.Series:
@@ -529,6 +686,8 @@ def is_cef(
     return df["PROCESO"].isin(
         PROCESOS_CEF
     )
+
+
 def es_paso_analista(
     df: pd.DataFrame,
 ) -> pd.Series:
@@ -537,16 +696,20 @@ def es_paso_analista(
         df["NBRPASO"]
         .eq(PASO_ANALISTA_TC)
     )
+
     paso_cef = (
         df["NBRPASO"]
         .eq(PASO_ANALISTA_CEF)
     )
+
     return (
         (is_tc(df) & paso_tc)
         | (is_cef(df) & paso_cef)
     )
+
+
 # ============================================================
-# 12. ENRIQUECIMIENTO CONTRA ORGÁNICO
+# 14. ENRIQUECIMIENTO CONTRA ORGÁNICO
 # ============================================================
 def enrich_analista_con_organico(
     snapshot: pd.DataFrame,
@@ -559,6 +722,7 @@ def enrich_analista_con_organico(
     3. Sin coincidencia.
     """
     result = snapshot.copy()
+
     organico_lookup = organico[
         [
             "CODMES",
@@ -568,9 +732,7 @@ def enrich_analista_con_organico(
             "UNIDAD_ORGANIZATIVA",
         ]
     ].copy()
-    # --------------------------------------------------------
-    # PRIMER CANDIDATO: NBRULTACTOR
-    # --------------------------------------------------------
+
     org_actor = organico_lookup.rename(
         columns={
             "CODMES":
@@ -585,6 +747,7 @@ def enrich_analista_con_organico(
                 "UNIDAD_ORGANIZATIVA_ACTOR",
         }
     )
+
     result = result.merge(
         org_actor,
         how="left",
@@ -598,9 +761,7 @@ def enrich_analista_con_organico(
         ],
         validate="many_to_one",
     )
-    # --------------------------------------------------------
-    # SEGUNDO CANDIDATO: NBRULTACTORPASO
-    # --------------------------------------------------------
+
     org_actor_paso = organico_lookup.rename(
         columns={
             "CODMES":
@@ -615,6 +776,7 @@ def enrich_analista_con_organico(
                 "UNIDAD_ORGANIZATIVA_ACTOR_PASO",
         }
     )
+
     result = result.merge(
         org_actor_paso,
         how="left",
@@ -628,12 +790,7 @@ def enrich_analista_con_organico(
         ],
         validate="many_to_one",
     )
-    # --------------------------------------------------------
-    # COINCIDENCIA REAL
-    #
-    # La existencia del nombre no es suficiente.
-    # Debe existir MATRICULA en Orgánico.
-    # --------------------------------------------------------
+
     match_actor = (
         result["MATRICULA_ACTOR"]
         .fillna("")
@@ -641,6 +798,7 @@ def enrich_analista_con_organico(
         .str.strip()
         .ne("")
     )
+
     match_actor_paso = (
         result["MATRICULA_ACTOR_PASO"]
         .fillna("")
@@ -648,14 +806,14 @@ def enrich_analista_con_organico(
         .str.strip()
         .ne("")
     )
-    # Primer candidato solamente si realmente encontró persona.
+
     use_actor = match_actor
-    # El segundo candidato se intenta cuando el primero
-    # NO encontró coincidencia real.
+
     use_actor_paso = (
         ~match_actor
         & match_actor_paso
     )
+
     result["NOMBRE_COMPLETO"] = np.select(
         [
             use_actor,
@@ -667,6 +825,7 @@ def enrich_analista_con_organico(
         ],
         default="",
     )
+
     result["UNIDAD_ORGANIZATIVA"] = np.select(
         [
             use_actor,
@@ -678,6 +837,7 @@ def enrich_analista_con_organico(
         ],
         default="",
     )
+
     result["ORIGEN_ANALISTA"] = np.select(
         [
             use_actor,
@@ -689,6 +849,7 @@ def enrich_analista_con_organico(
         ],
         default=ORIGEN_SIN_COINCIDENCIA,
     )
+
     result["NOMBRE_COMPLETO"] = (
         pd.Series(
             result["NOMBRE_COMPLETO"],
@@ -698,6 +859,7 @@ def enrich_analista_con_organico(
         .astype(str)
         .str.strip()
     )
+
     result["UNIDAD_ORGANIZATIVA"] = (
         pd.Series(
             result["UNIDAD_ORGANIZATIVA"],
@@ -707,6 +869,7 @@ def enrich_analista_con_organico(
         .astype(str)
         .str.strip()
     )
+
     result["ORIGEN_ANALISTA"] = (
         pd.Series(
             result["ORIGEN_ANALISTA"],
@@ -717,36 +880,35 @@ def enrich_analista_con_organico(
         )
         .astype(str)
     )
-    # --------------------------------------------------------
-    # VALIDACIÓN DE CONSISTENCIA DEL ORGÁNICO
-    #
-    # Nombre y unidad deben proceder siempre del mismo
-    # candidato.
-    # --------------------------------------------------------
+
     expected_name_actor = (
         result["NOMBRE_COMPLETO_ACTOR"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
+
     expected_unit_actor = (
         result["UNIDAD_ORGANIZATIVA_ACTOR"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
+
     expected_name_actor_paso = (
         result["NOMBRE_COMPLETO_ACTOR_PASO"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
+
     expected_unit_actor_paso = (
         result["UNIDAD_ORGANIZATIVA_ACTOR_PASO"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
+
     inconsistent_actor = (
         use_actor
         & (
@@ -758,6 +920,7 @@ def enrich_analista_con_organico(
             )
         )
     )
+
     inconsistent_actor_paso = (
         use_actor_paso
         & (
@@ -769,6 +932,7 @@ def enrich_analista_con_organico(
             )
         )
     )
+
     if (
         inconsistent_actor.any()
         or inconsistent_actor_paso.any()
@@ -778,9 +942,12 @@ def enrich_analista_con_organico(
             "NOMBRE_COMPLETO y UNIDAD_ORGANIZATIVA "
             "desde ORGANICO.csv."
         )
+
     return result
+
+
 # ============================================================
-# 13. CONSTRUCCIÓN DEL SNAPSHOT
+# 15. CONSTRUCCIÓN DEL SNAPSHOT
 # ============================================================
 def build_snapshot(
     solicitudes: pd.DataFrame,
@@ -791,20 +958,21 @@ def build_snapshot(
     mask_analista = es_paso_analista(
         solicitudes
     )
+
     eventos = solicitudes.loc[
         mask_analista
     ].copy()
+
     if eventos.empty:
         empty_snapshot = pd.DataFrame(
             columns=FINAL_COLUMNS
         )
+
         return (
             empty_snapshot,
             eventos,
         )
-    # --------------------------------------------------------
-    # ORDEN DE EVENTOS
-    # --------------------------------------------------------
+
     eventos = eventos.sort_values(
         by=[
             "NUMOPORTUNIDAD",
@@ -821,20 +989,12 @@ def build_snapshot(
         na_position="last",
         kind="stable",
     ).copy()
+
     expected_opportunities = (
         eventos["NUMOPORTUNIDAD"]
         .nunique(dropna=False)
     )
-    # --------------------------------------------------------
-    # ÚLTIMO EVENTO DEL PASO ANALISTA
-    #
-    # Se utiliza para:
-    # - PROCESO
-    # - NBRULTACTOR
-    # - NBRULTACTORPASO
-    #
-    # NO se utiliza para determinar las fechas agregadas.
-    # --------------------------------------------------------
+
     ultimo_evento = (
         eventos
         .drop_duplicates(
@@ -852,12 +1012,7 @@ def build_snapshot(
         ]
         .copy()
     )
-    # --------------------------------------------------------
-    # FECHAS DEL ANALISTA
-    #
-    # Llegada = MIN(inicio)
-    # Fin     = MAX(fin)
-    # --------------------------------------------------------
+
     fechas = (
         eventos
         .groupby(
@@ -876,9 +1031,7 @@ def build_snapshot(
             ),
         )
     )
-    # --------------------------------------------------------
-    # ÚLTIMO ESTADO FUERTE
-    # --------------------------------------------------------
+
     eventos_fuertes = eventos.loc[
         eventos[
             "ESTADOSOLICITUDPASO"
@@ -886,6 +1039,7 @@ def build_snapshot(
             ESTADOS_FUERTES
         )
     ].copy()
+
     if eventos_fuertes.empty:
         ultimo_fuerte = pd.DataFrame(
             columns=[
@@ -893,6 +1047,7 @@ def build_snapshot(
                 "RESULTADO_FUERTE",
             ]
         )
+
     else:
         ultimo_fuerte = (
             eventos_fuertes
@@ -915,9 +1070,7 @@ def build_snapshot(
             )
             .copy()
         )
-    # --------------------------------------------------------
-    # HISTÓRICO RECUPERADA
-    # --------------------------------------------------------
+
     recuperada_historica = (
         eventos
         .assign(
@@ -942,35 +1095,34 @@ def build_snapshot(
             }
         )
     )
-    # --------------------------------------------------------
-    # CONSOLIDACIÓN 1 A 1
-    # --------------------------------------------------------
+
     snapshot = ultimo_evento.merge(
         fechas,
         how="inner",
         on="NUMOPORTUNIDAD",
         validate="one_to_one",
     )
+
     snapshot = snapshot.merge(
         ultimo_fuerte,
         how="left",
         on="NUMOPORTUNIDAD",
         validate="one_to_one",
     )
+
     snapshot = snapshot.merge(
         recuperada_historica,
         how="left",
         on="NUMOPORTUNIDAD",
         validate="one_to_one",
     )
+
     snapshot["TUVO_RECUPERADA"] = (
         snapshot["TUVO_RECUPERADA"]
         .fillna(False)
         .astype(bool)
     )
-    # --------------------------------------------------------
-    # RESULTADO FINAL
-    # --------------------------------------------------------
+
     tiene_estado_fuerte = (
         snapshot["RESULTADO_FUERTE"]
         .fillna("")
@@ -979,6 +1131,7 @@ def build_snapshot(
             ESTADOS_FUERTES
         )
     )
+
     snapshot["RESULTADOANALISTA"] = np.select(
         [
             tiene_estado_fuerte,
@@ -992,6 +1145,7 @@ def build_snapshot(
         ],
         default="PENDIENTE",
     )
+
     snapshot["RESULTADOANALISTA"] = (
         pd.Series(
             snapshot["RESULTADOANALISTA"],
@@ -1000,9 +1154,7 @@ def build_snapshot(
         .fillna("PENDIENTE")
         .astype(str)
     )
-    # --------------------------------------------------------
-    # FLAGS
-    # --------------------------------------------------------
+
     snapshot["FLG_APROBADO"] = (
         snapshot[
             "RESULTADOANALISTA"
@@ -1010,6 +1162,7 @@ def build_snapshot(
         .eq("APROBADO")
         .astype("Int64")
     )
+
     snapshot["FLG_RECHAZADO"] = (
         snapshot[
             "RESULTADOANALISTA"
@@ -1017,6 +1170,7 @@ def build_snapshot(
         .eq("RECHAZADO")
         .astype("Int64")
     )
+
     snapshot["FLG_RECUPERADA"] = (
         snapshot[
             "RESULTADOANALISTA"
@@ -1024,6 +1178,7 @@ def build_snapshot(
         .eq("RECUPERADA")
         .astype("Int64")
     )
+
     snapshot["FLG_PENDIENTE"] = (
         snapshot[
             "RESULTADOANALISTA"
@@ -1031,15 +1186,12 @@ def build_snapshot(
         .eq("PENDIENTE")
         .astype("Int64")
     )
+
     snapshot["FLGSTATUSRECUPERADA"] = (
         snapshot["TUVO_RECUPERADA"]
         .astype("Int64")
     )
-    # --------------------------------------------------------
-    # CODMESEVALUACION
-    #
-    # ÚNICAMENTE desde FH_LLEGA_ANALISTA.
-    # --------------------------------------------------------
+
     snapshot["CODMESEVALUACION"] = (
         codmes_from_timestamp(
             snapshot[
@@ -1047,24 +1199,18 @@ def build_snapshot(
             ]
         )
     )
-    # --------------------------------------------------------
-    # ENRIQUECIMIENTO CON ORGÁNICO
-    # --------------------------------------------------------
+
     snapshot = (
         enrich_analista_con_organico(
             snapshot=snapshot,
             organico=organico,
         )
     )
-    # --------------------------------------------------------
-    # FECHA DE ACTUALIZACIÓN DEL ARCHIVO
-    # --------------------------------------------------------
+
     snapshot[
         "FH_ACTUALIZACION_ARCHIVO"
     ] = fh_actualizacion_archivo
-    # --------------------------------------------------------
-    # VALIDACIÓN TEMPRANA DE CANTIDAD
-    # --------------------------------------------------------
+
     if len(snapshot) != expected_opportunities:
         raise ValueError(
             "La cantidad de filas consolidadas no coincide "
@@ -1075,12 +1221,15 @@ def build_snapshot(
             f"Filas consolidadas: "
             f"{len(snapshot):,}"
         )
+
     return (
         snapshot,
         eventos,
     )
+
+
 # ============================================================
-# 14. VALIDACIONES DEL RESULTADO
+# 16. VALIDACIONES DEL RESULTADO
 # ============================================================
 def validate_snapshot(
     snapshot: pd.DataFrame,
@@ -1094,9 +1243,7 @@ def validate_snapshot(
                 "pero el snapshot contiene registros."
             )
         return
-    # --------------------------------------------------------
-    # 1. UNICIDAD
-    # --------------------------------------------------------
+
     duplicated_mask = (
         snapshot[
             "NUMOPORTUNIDAD"
@@ -1105,6 +1252,7 @@ def validate_snapshot(
             keep=False
         )
     )
+
     if duplicated_mask.any():
         duplicated_values = (
             snapshot.loc[
@@ -1114,6 +1262,7 @@ def validate_snapshot(
             .drop_duplicates()
             .tolist()
         )
+
         raise ValueError(
             "Se detectaron NUMOPORTUNIDAD duplicados "
             "en el snapshot.\n"
@@ -1122,9 +1271,7 @@ def validate_snapshot(
             f"Primeros ejemplos: "
             f"{duplicated_values[:10]}"
         )
-    # --------------------------------------------------------
-    # 2. CANTIDAD ESPERADA
-    # --------------------------------------------------------
+
     expected_count = (
         eventos_analista[
             "NUMOPORTUNIDAD"
@@ -1133,6 +1280,7 @@ def validate_snapshot(
             dropna=False
         )
     )
+
     if len(snapshot) != expected_count:
         raise ValueError(
             "La cantidad final de filas no coincide "
@@ -1141,16 +1289,16 @@ def validate_snapshot(
             f"Esperadas: {expected_count:,}\n"
             f"Obtenidas: {len(snapshot):,}"
         )
-    # --------------------------------------------------------
-    # 3. FLAGS MUTUAMENTE EXCLUYENTES
-    # --------------------------------------------------------
+
     flag_sum = (
         snapshot["FLG_APROBADO"]
         + snapshot["FLG_RECHAZADO"]
         + snapshot["FLG_RECUPERADA"]
         + snapshot["FLG_PENDIENTE"]
     )
+
     invalid_flags = flag_sum.ne(1)
+
     if invalid_flags.any():
         examples = (
             snapshot.loc[
@@ -1167,15 +1315,14 @@ def validate_snapshot(
             .head(10)
             .to_string(index=False)
         )
+
         raise ValueError(
             "Los flags finales no son mutuamente "
             "excluyentes.\n"
             "La suma debe ser exactamente 1.\n"
             f"Ejemplos:\n{examples}"
         )
-    # --------------------------------------------------------
-    # 4. FLAG HISTÓRICO RECUPERADA
-    # --------------------------------------------------------
+
     expected_recuperada = (
         eventos_analista
         .assign(
@@ -1194,6 +1341,7 @@ def validate_snapshot(
         .max()
         .astype("Int64")
     )
+
     actual_recuperada = (
         snapshot
         .set_index(
@@ -1203,12 +1351,14 @@ def validate_snapshot(
         ]
         .astype("Int64")
     )
+
     expected_recuperada = (
         expected_recuperada
         .reindex(
             actual_recuperada.index
         )
     )
+
     mismatch_recuperada = (
         actual_recuperada
         .ne(
@@ -1216,6 +1366,7 @@ def validate_snapshot(
         )
         .fillna(True)
     )
+
     if mismatch_recuperada.any():
         affected = (
             actual_recuperada
@@ -1224,15 +1375,14 @@ def validate_snapshot(
             ]
             .tolist()
         )
+
         raise ValueError(
             "FLGSTATUSRECUPERADA no coincide con "
             "el histórico real de RECUPERADA.\n"
             f"Primeras oportunidades afectadas: "
             f"{affected[:10]}"
         )
-    # --------------------------------------------------------
-    # 5. FECHA DE FIN
-    # --------------------------------------------------------
+
     expected_fin = (
         eventos_analista
         .groupby(
@@ -1243,6 +1393,7 @@ def validate_snapshot(
         ]
         .max()
     )
+
     actual_fin = (
         snapshot
         .set_index(
@@ -1251,12 +1402,14 @@ def validate_snapshot(
             "FH_FIN_ANALISTA"
         ]
     )
+
     expected_fin = (
         expected_fin
         .reindex(
             actual_fin.index
         )
     )
+
     same_fin = (
         actual_fin.eq(
             expected_fin
@@ -1266,6 +1419,7 @@ def validate_snapshot(
             & expected_fin.isna()
         )
     )
+
     if not same_fin.all():
         affected = (
             actual_fin
@@ -1274,15 +1428,14 @@ def validate_snapshot(
             ]
             .tolist()
         )
+
         raise ValueError(
             "FH_FIN_ANALISTA no coincide con "
             "MAX(FECHORFINEVALUACION).\n"
             f"Primeras oportunidades afectadas: "
             f"{affected[:10]}"
         )
-    # --------------------------------------------------------
-    # 6. FECHA DE LLEGADA
-    # --------------------------------------------------------
+
     expected_inicio = (
         eventos_analista
         .groupby(
@@ -1293,6 +1446,7 @@ def validate_snapshot(
         ]
         .min()
     )
+
     actual_inicio = (
         snapshot
         .set_index(
@@ -1301,12 +1455,14 @@ def validate_snapshot(
             "FH_LLEGA_ANALISTA"
         ]
     )
+
     expected_inicio = (
         expected_inicio
         .reindex(
             actual_inicio.index
         )
     )
+
     same_inicio = (
         actual_inicio.eq(
             expected_inicio
@@ -1316,6 +1472,7 @@ def validate_snapshot(
             & expected_inicio.isna()
         )
     )
+
     if not same_inicio.all():
         affected = (
             actual_inicio
@@ -1324,15 +1481,14 @@ def validate_snapshot(
             ]
             .tolist()
         )
+
         raise ValueError(
             "FH_LLEGA_ANALISTA no coincide con "
             "MIN(FECHORINICIOEVALUACION).\n"
             f"Primeras oportunidades afectadas: "
             f"{affected[:10]}"
         )
-    # --------------------------------------------------------
-    # 7. CODMESEVALUACION
-    # --------------------------------------------------------
+
     expected_codmes = (
         codmes_from_timestamp(
             snapshot[
@@ -1342,6 +1498,7 @@ def validate_snapshot(
         .fillna("")
         .astype(str)
     )
+
     actual_codmes = (
         snapshot[
             "CODMESEVALUACION"
@@ -1349,11 +1506,13 @@ def validate_snapshot(
         .fillna("")
         .astype(str)
     )
+
     invalid_codmes = (
         actual_codmes.ne(
             expected_codmes
         )
     )
+
     if invalid_codmes.any():
         examples = (
             snapshot.loc[
@@ -1367,19 +1526,19 @@ def validate_snapshot(
             .head(10)
             .to_string(index=False)
         )
+
         raise ValueError(
             "CODMESEVALUACION no corresponde al "
             "mes de FH_LLEGA_ANALISTA.\n"
             f"Ejemplos:\n{examples}"
         )
-    # --------------------------------------------------------
-    # 8. CONSISTENCIA ORGÁNICO
-    # --------------------------------------------------------
+
     valid_origins = {
         ORIGEN_ULTIMO_ACTOR,
         ORIGEN_ULTIMO_ACTOR_PASO,
         ORIGEN_SIN_COINCIDENCIA,
     }
+
     invalid_origin = (
         ~snapshot[
             "ORIGEN_ANALISTA"
@@ -1387,6 +1546,7 @@ def validate_snapshot(
             valid_origins
         )
     )
+
     if invalid_origin.any():
         examples = (
             snapshot.loc[
@@ -1399,11 +1559,13 @@ def validate_snapshot(
             .head(10)
             .to_string(index=False)
         )
+
         raise ValueError(
             "Se detectaron valores inválidos en "
             "ORIGEN_ANALISTA.\n"
             f"Ejemplos:\n{examples}"
         )
+
     no_match = (
         snapshot[
             "ORIGEN_ANALISTA"
@@ -1411,6 +1573,7 @@ def validate_snapshot(
             ORIGEN_SIN_COINCIDENCIA
         )
     )
+
     invalid_no_match = (
         no_match
         & (
@@ -1426,6 +1589,7 @@ def validate_snapshot(
             .ne("")
         )
     )
+
     if invalid_no_match.any():
         examples = (
             snapshot.loc[
@@ -1440,21 +1604,21 @@ def validate_snapshot(
             .head(10)
             .to_string(index=False)
         )
+
         raise ValueError(
             "Existen oportunidades sin coincidencia "
             "de Orgánico que contienen información "
             "de analista.\n"
             f"Ejemplos:\n{examples}"
         )
-    # --------------------------------------------------------
-    # RESULTADOS VÁLIDOS
-    # --------------------------------------------------------
+
     valid_results = {
         "APROBADO",
         "RECHAZADO",
         "RECUPERADA",
         "PENDIENTE",
     }
+
     invalid_result = (
         ~snapshot[
             "RESULTADOANALISTA"
@@ -1462,6 +1626,7 @@ def validate_snapshot(
             valid_results
         )
     )
+
     if invalid_result.any():
         examples = (
             snapshot.loc[
@@ -1474,13 +1639,16 @@ def validate_snapshot(
             .head(10)
             .to_string(index=False)
         )
+
         raise ValueError(
             "Se detectaron RESULTADOANALISTA "
             "inválidos.\n"
             f"Ejemplos:\n{examples}"
         )
+
+
 # ============================================================
-# 15. RESUMEN
+# 17. RESUMEN
 # ============================================================
 def show_summary(
     input_rows: int,
@@ -1493,6 +1661,7 @@ def show_summary(
     cantidad_eventos = len(
         eventos_analista
     )
+
     if eventos_analista.empty:
         oportunidades_filtradas = 0
     else:
@@ -1504,13 +1673,16 @@ def show_summary(
                 dropna=False
             )
         )
+
     oportunidades_finales = len(
         snapshot
     )
+
     if snapshot.empty:
         oportunidades_con_organico = 0
         oportunidades_sin_organico = 0
         cobertura = 0.0
+
     else:
         oportunidades_con_organico = int(
             snapshot[
@@ -1521,6 +1693,7 @@ def show_summary(
             )
             .sum()
         )
+
         oportunidades_sin_organico = int(
             snapshot[
                 "ORIGEN_ANALISTA"
@@ -1530,64 +1703,79 @@ def show_summary(
             )
             .sum()
         )
+
         cobertura = (
             oportunidades_con_organico
             / oportunidades_finales
             * 100
         )
+
     print()
     print("=" * 70)
     print("RESUMEN DE EJECUCIÓN")
     print("=" * 70)
+
     print(
         f"FH_ACTUALIZACION_ARCHIVO        : "
         f"{fh_actualizacion_archivo}"
     )
+
     print(
         f"Filas leídas INF_SOLICITUDES    : "
         f"{input_rows:,}"
     )
+
     print(
         f"Filas válidas ORGANICO           : "
         f"{organico_rows:,}"
     )
+
     print(
         f"Eventos del paso analista        : "
         f"{cantidad_eventos:,}"
     )
+
     print(
         f"Oportunidades únicas filtradas   : "
         f"{oportunidades_filtradas:,}"
     )
+
     print(
         f"Oportunidades finales            : "
         f"{oportunidades_finales:,}"
     )
+
     print(
         f"Con coincidencia en Orgánico     : "
         f"{oportunidades_con_organico:,}"
     )
+
     print(
         f"Sin coincidencia en Orgánico     : "
         f"{oportunidades_sin_organico:,}"
     )
+
     print(
         f"Cobertura de Orgánico            : "
         f"{cobertura:.2f}%"
     )
+
     print()
     print("RESULTADOANALISTA")
     print("-" * 70)
+
     result_order = [
         "APROBADO",
         "RECHAZADO",
         "RECUPERADA",
         "PENDIENTE",
     ]
+
     if snapshot.empty:
         result_counts = pd.Series(
             dtype="int64"
         )
+
     else:
         result_counts = (
             snapshot[
@@ -1597,6 +1785,7 @@ def show_summary(
                 dropna=False
             )
         )
+
     for result in result_order:
         count = int(
             result_counts.get(
@@ -1604,22 +1793,27 @@ def show_summary(
                 0,
             )
         )
+
         print(
             f"{result:<30}: "
             f"{count:,}"
         )
+
     print()
     print("ORIGEN_ANALISTA")
     print("-" * 70)
+
     origin_order = [
         ORIGEN_ULTIMO_ACTOR,
         ORIGEN_ULTIMO_ACTOR_PASO,
         ORIGEN_SIN_COINCIDENCIA,
     ]
+
     if snapshot.empty:
         origin_counts = pd.Series(
             dtype="int64"
         )
+
     else:
         origin_counts = (
             snapshot[
@@ -1629,6 +1823,7 @@ def show_summary(
                 dropna=False
             )
         )
+
     for origin in origin_order:
         count = int(
             origin_counts.get(
@@ -1636,33 +1831,43 @@ def show_summary(
                 0,
             )
         )
+
         print(
             f"{origin:<30}: "
             f"{count:,}"
         )
+
     print("=" * 70)
     print()
+
+
 # ============================================================
-# 16. EXPORTACIÓN
+# 18. EXPORTACIÓN ATÓMICA
 # ============================================================
 def export_output(
     snapshot: pd.DataFrame,
     output_file: Path,
 ) -> int:
-    """Prepara y exporta el CSV final."""
+    """
+    Prepara y exporta el CSV final.
+
+    Primero escribe a un archivo temporal y después reemplaza
+    el archivo definitivo para evitar que Excel/Power Query
+    lea un CSV mientras todavía se está escribiendo.
+    """
     output_file.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
+
     if snapshot.empty:
         output = pd.DataFrame(
             columns=FINAL_COLUMNS
         )
+
     else:
         output = snapshot.copy()
-        # ----------------------------------------------------
-        # FORMATO FINAL DE FECHAS
-        # ----------------------------------------------------
+
         output[
             "FH_LLEGA_ANALISTA"
         ] = format_timestamp_series(
@@ -1670,6 +1875,7 @@ def export_output(
                 "FH_LLEGA_ANALISTA"
             ]
         )
+
         output[
             "FH_FIN_ANALISTA"
         ] = format_timestamp_series(
@@ -1677,17 +1883,13 @@ def export_output(
                 "FH_FIN_ANALISTA"
             ]
         )
-        # ----------------------------------------------------
-        # FLAGS COMO Int64
-        # ----------------------------------------------------
+
         for column in FLAG_COLUMNS:
             output[column] = (
                 output[column]
                 .astype("Int64")
             )
-        # ----------------------------------------------------
-        # COLUMNAS DE TEXTO
-        # ----------------------------------------------------
+
         text_columns = [
             "NUMOPORTUNIDAD",
             "CODMESEVALUACION",
@@ -1699,18 +1901,18 @@ def export_output(
             "FH_FIN_ANALISTA",
             "FH_ACTUALIZACION_ARCHIVO",
         ]
+
         for column in text_columns:
             output[column] = (
                 output[column]
                 .fillna("")
                 .astype(str)
             )
-        # ----------------------------------------------------
-        # SELECCIÓN EXPLÍCITA DE LAS 14 COLUMNAS
-        # ----------------------------------------------------
+
         output = output[
             FINAL_COLUMNS
         ].copy()
+
     if list(output.columns) != FINAL_COLUMNS:
         raise ValueError(
             "Las columnas finales no coinciden "
@@ -1718,19 +1920,383 @@ def export_output(
             f"Esperadas: {FINAL_COLUMNS}\n"
             f"Obtenidas: {list(output.columns)}"
         )
+
+    temp_file = output_file.with_name(
+        f"{output_file.stem}__TEMP{output_file.suffix}"
+    )
+
+    if temp_file.exists():
+        try:
+            temp_file.unlink()
+        except Exception:
+            pass
+
     output.to_csv(
-        output_file,
+        temp_file,
         sep=";",
         index=False,
         encoding="utf-8-sig",
         na_rep="",
     )
+
+    os.replace(
+        temp_file,
+        output_file,
+    )
+
     return len(output)
+
+
 # ============================================================
-# 17. RUN
+# 19. VALIDACIÓN DE ARCHIVO DE ENTRADA
 # ============================================================
-def run() -> None:
-    """Ejecuta el seguimiento diario de producción."""
+def is_file_readable(
+    file_path: Path,
+) -> bool:
+    """
+    Intenta abrir el archivo para validar que ya esté disponible.
+    """
+    try:
+        with file_path.open(
+            "rb"
+        ) as file:
+            file.read(1)
+
+        return True
+
+    except (
+        PermissionError,
+        OSError,
+    ):
+        return False
+
+
+def wait_until_file_is_ready(
+    file_path: Path,
+) -> None:
+    """
+    Espera hasta que el archivo deje de crecer/cambiar y pueda
+    abrirse correctamente.
+    """
+    logger.info(
+        "Verificando que INF_SOLICITUDES.csv haya terminado de copiarse..."
+    )
+
+    previous_size = None
+    previous_mtime_ns = None
+
+    for attempt in range(
+        1,
+        FILE_READY_MAX_ATTEMPTS + 1,
+    ):
+        if not file_path.exists():
+            raise FileNotFoundError(
+                f"El archivo desapareció durante la validación:\n"
+                f"{file_path}"
+            )
+
+        try:
+            stat = file_path.stat()
+        except OSError:
+            time.sleep(
+                FILE_STABLE_SECONDS
+            )
+            continue
+
+        current_size = stat.st_size
+        current_mtime_ns = stat.st_mtime_ns
+
+        stable = (
+            previous_size is not None
+            and previous_mtime_ns is not None
+            and current_size == previous_size
+            and current_mtime_ns == previous_mtime_ns
+        )
+
+        if (
+            stable
+            and current_size > 0
+            and is_file_readable(file_path)
+        ):
+            logger.info(
+                "Archivo de entrada estable y disponible."
+            )
+            return
+
+        previous_size = current_size
+        previous_mtime_ns = current_mtime_ns
+
+        logger.info(
+            "Archivo aún no está listo. "
+            "Intento %s/%s...",
+            attempt,
+            FILE_READY_MAX_ATTEMPTS,
+        )
+
+        time.sleep(
+            FILE_STABLE_SECONDS
+        )
+
+    raise TimeoutError(
+        "El archivo INF_SOLICITUDES.csv no quedó estable "
+        "dentro del tiempo máximo de espera."
+    )
+
+
+# ============================================================
+# 20. ARCHIVO HISTÓRICO DEL INPUT
+# ============================================================
+def build_unique_archive_path() -> Path:
+    """
+    Construye un nombre histórico único para evitar colisiones.
+    """
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S_%f"
+    )
+
+    return (
+        ARCHIVE_DIR
+        / f"INF_SOLICITUDES_{timestamp}.csv"
+    )
+
+
+def archive_input_file(
+    source_file: Path,
+) -> tuple[Path, float]:
+    """
+    Mueve el input recibido a /archive y retorna:
+    - ruta histórica
+    - fecha de modificación original
+    """
+    require_file(
+        source_file
+    )
+
+    original_mtime = (
+        source_file
+        .stat()
+        .st_mtime
+    )
+
+    archive_file = (
+        build_unique_archive_path()
+    )
+
+    ARCHIVE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    shutil.move(
+        str(source_file),
+        str(archive_file),
+    )
+
+    logger.info(
+        "Archivo movido a archive: %s",
+        archive_file,
+    )
+
+    return (
+        archive_file,
+        original_mtime,
+    )
+
+
+# ============================================================
+# 21. ACTUALIZACIÓN DE EXCEL
+# ============================================================
+def refresh_pivot_tables(
+    workbook,
+) -> int:
+    """
+    Refresca todas las tablas dinámicas del libro.
+    Retorna cuántas tablas dinámicas intentó actualizar.
+    """
+    pivot_count = 0
+
+    for worksheet in workbook.Worksheets:
+        try:
+            pivot_tables = worksheet.PivotTables()
+            count = pivot_tables.Count
+
+        except Exception:
+            continue
+
+        for index in range(
+            1,
+            count + 1,
+        ):
+            pivot = pivot_tables.Item(
+                index
+            )
+
+            pivot_count += 1
+
+            try:
+                pivot.PivotCache().Refresh()
+
+            except Exception as exc:
+                logger.warning(
+                    "No se pudo refrescar una tabla dinámica "
+                    "en la hoja '%s': %s",
+                    worksheet.Name,
+                    exc,
+                )
+
+    return pivot_count
+
+
+def refresh_excel(
+    excel_file: Path,
+) -> None:
+    """
+    Abre Excel en segundo plano, actualiza Power Query/
+    conexiones, tablas dinámicas, recalcula y guarda.
+    """
+    require_file(
+        excel_file
+    )
+
+    last_error = None
+
+    for attempt in range(
+        1,
+        EXCEL_OPEN_RETRIES + 1,
+    ):
+        excel = None
+        workbook = None
+
+        try:
+            logger.info(
+                "Actualizando Excel. Intento %s/%s...",
+                attempt,
+                EXCEL_OPEN_RETRIES,
+            )
+
+            pythoncom.CoInitialize()
+
+            excel = win32com.client.DispatchEx(
+                "Excel.Application"
+            )
+
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            excel.ScreenUpdating = False
+            excel.EnableEvents = False
+
+            workbook = excel.Workbooks.Open(
+                str(excel_file),
+                UpdateLinks=0,
+                ReadOnly=False,
+            )
+
+            if workbook.ReadOnly:
+                raise PermissionError(
+                    "SEGUIMIENTO_DESEMPEÑO.xlsx fue abierto "
+                    "en modo solo lectura. Probablemente está "
+                    "bloqueado por otra sesión de Excel."
+                )
+
+            logger.info(
+                "Ejecutando RefreshAll()..."
+            )
+
+            workbook.RefreshAll()
+
+            try:
+                excel.CalculateUntilAsyncQueriesDone()
+            except Exception as exc:
+                logger.warning(
+                    "CalculateUntilAsyncQueriesDone() no pudo "
+                    "ejecutarse completamente: %s",
+                    exc,
+                )
+
+            time.sleep(
+                EXCEL_POST_REFRESH_WAIT_SECONDS
+            )
+
+            logger.info(
+                "Actualizando tablas dinámicas..."
+            )
+
+            pivot_count = (
+                refresh_pivot_tables(
+                    workbook
+                )
+            )
+
+            try:
+                excel.CalculateFull()
+            except Exception as exc:
+                logger.warning(
+                    "No se pudo ejecutar CalculateFull(): %s",
+                    exc,
+                )
+
+            workbook.Save()
+
+            logger.info(
+                "Excel guardado correctamente. "
+                "Tablas dinámicas procesadas: %s",
+                pivot_count,
+            )
+
+            return
+
+        except Exception as exc:
+            last_error = exc
+
+            logger.exception(
+                "Error actualizando Excel en intento %s/%s.",
+                attempt,
+                EXCEL_OPEN_RETRIES,
+            )
+
+            if attempt < EXCEL_OPEN_RETRIES:
+                time.sleep(
+                    EXCEL_OPEN_RETRY_SECONDS
+                )
+
+        finally:
+            if workbook is not None:
+                try:
+                    workbook.Close(
+                        SaveChanges=False
+                    )
+                except Exception:
+                    pass
+
+            if excel is not None:
+                try:
+                    excel.Quit()
+                except Exception:
+                    pass
+
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    raise RuntimeError(
+        "No fue posible actualizar "
+        f"{excel_file.name} después de "
+        f"{EXCEL_OPEN_RETRIES} intentos."
+    ) from last_error
+
+
+# ============================================================
+# 22. PROCESAMIENTO PRINCIPAL DE UN INPUT
+# ============================================================
+def run(
+    input_file: Path,
+    input_mtime: float,
+) -> None:
+    """
+    Ejecuta el procesamiento de un archivo INF_SOLICITUDES
+    previamente archivado.
+    """
     print()
     print("=" * 70)
     print(
@@ -1738,23 +2304,15 @@ def run() -> None:
     )
     print("=" * 70)
     print()
-    # --------------------------------------------------------
-    # VALIDACIÓN DE ARCHIVOS
-    # --------------------------------------------------------
+
     require_file(
-        INPUT_FILE
+        input_file
     )
+
     require_file(
         ORGANICO_FILE
     )
-    # --------------------------------------------------------
-    # FH_ACTUALIZACION_ARCHIVO
-    # --------------------------------------------------------
-    input_mtime = (
-        INPUT_FILE
-        .stat()
-        .st_mtime
-    )
+
     fh_actualizacion_archivo = (
         datetime.fromtimestamp(
             input_mtime
@@ -1763,51 +2321,53 @@ def run() -> None:
             "%Y-%m-%d %H:%M:%S"
         )
     )
+
     print(
         "FH_ACTUALIZACION_ARCHIVO: "
         f"{fh_actualizacion_archivo}"
     )
-    # --------------------------------------------------------
-    # INF_SOLICITUDES
-    # --------------------------------------------------------
+
     print()
     print(
         "Leyendo INF_SOLICITUDES.csv..."
     )
+
     solicitudes = load_solicitudes(
-        INPUT_FILE
+        input_file
     )
+
     input_rows = len(
         solicitudes
     )
+
     print(
         "Filas leídas de INF_SOLICITUDES.csv: "
         f"{input_rows:,}"
     )
-    # --------------------------------------------------------
-    # ORGANICO
-    # --------------------------------------------------------
+
     print()
     print(
         "Leyendo ORGANICO.csv..."
     )
+
     organico = load_organico(
         ORGANICO_FILE
     )
+
     organico_rows = len(
         organico
     )
+
     print(
         "Filas válidas de ORGANICO.csv: "
         f"{organico_rows:,}"
     )
-    # --------------------------------------------------------
-    # SNAPSHOT
-    # --------------------------------------------------------
+
     print()
     print(
         "Identificando eventos del paso analista..."
     )
+
     snapshot, eventos_analista = (
         build_snapshot(
             solicitudes=solicitudes,
@@ -1817,11 +2377,14 @@ def run() -> None:
             ),
         )
     )
+
     cantidad_eventos = len(
         eventos_analista
     )
+
     if eventos_analista.empty:
         oportunidades_filtradas = 0
+
     else:
         oportunidades_filtradas = (
             eventos_analista[
@@ -1831,31 +2394,31 @@ def run() -> None:
                 dropna=False
             )
         )
+
     print(
         "Eventos identificados como paso analista: "
         f"{cantidad_eventos:,}"
     )
+
     print(
         "Oportunidades únicas después del filtro: "
         f"{oportunidades_filtradas:,}"
     )
-    # --------------------------------------------------------
-    # VALIDACIONES
-    # --------------------------------------------------------
+
     print()
     print(
         "Ejecutando validaciones de consistencia..."
     )
+
     validate_snapshot(
         snapshot=snapshot,
         eventos_analista=eventos_analista,
     )
+
     print(
         "Validaciones completadas correctamente."
     )
-    # --------------------------------------------------------
-    # RESUMEN
-    # --------------------------------------------------------
+
     show_summary(
         input_rows=input_rows,
         organico_rows=organico_rows,
@@ -1865,27 +2428,45 @@ def run() -> None:
             fh_actualizacion_archivo
         ),
     )
-    # --------------------------------------------------------
-    # EXPORTACIÓN
-    # --------------------------------------------------------
+
     print(
         "Exportando resultado..."
     )
+
     row_count = export_output(
         snapshot=snapshot,
         output_file=OUTPUT_FILE,
     )
+
     print()
     print(
         "Archivo generado:"
     )
+
     print(
         OUTPUT_FILE
     )
+
     print(
         "Cantidad de filas exportadas: "
         f"{row_count:,}"
     )
+
+    logger.info(
+        "CSV final generado correctamente: %s | filas=%s",
+        OUTPUT_FILE,
+        row_count,
+    )
+
+    print()
+    print(
+        "Actualizando SEGUIMIENTO_DESEMPEÑO.xlsx..."
+    )
+
+    refresh_excel(
+        EXCEL_FILE
+    )
+
     print()
     print("=" * 70)
     print(
@@ -1893,8 +2474,111 @@ def run() -> None:
     )
     print("=" * 70)
     print()
+
+
 # ============================================================
-# 18. EJECUCIÓN
+# 23. WATCHER CONTINUO
+# ============================================================
+def watch() -> None:
+    """
+    Mantiene el proceso vivo.
+
+    Cada vez que aparece INPUT_FILE:
+    1. Espera a que termine de copiarse.
+    2. Lo mueve a archive.
+    3. Ejecuta el procesamiento.
+    4. Genera el CSV para Excel.
+    5. Refresca y guarda el Excel.
+    6. Vuelve a esperar otro archivo.
+    """
+    print()
+    print("=" * 70)
+    print("WATCHER - SEGUIMIENTO DESEMPEÑO ANALISTAS")
+    print("=" * 70)
+    print(f"Entrada esperada : {INPUT_FILE}")
+    print(f"Archive          : {ARCHIVE_DIR}")
+    print(f"Output CSV       : {OUTPUT_FILE}")
+    print(f"Excel            : {EXCEL_FILE}")
+    print(
+        f"Intervalo watcher: {CHECK_INTERVAL_SECONDS} segundos"
+    )
+    print("=" * 70)
+    print()
+
+    logger.info(
+        "Watcher iniciado."
+    )
+
+    while True:
+        try:
+            if not INPUT_FILE.exists():
+                time.sleep(
+                    CHECK_INTERVAL_SECONDS
+                )
+                continue
+
+            logger.info(
+                "Nuevo INF_SOLICITUDES.csv detectado: %s",
+                INPUT_FILE,
+            )
+
+            wait_until_file_is_ready(
+                INPUT_FILE
+            )
+
+            archived_file, original_mtime = (
+                archive_input_file(
+                    INPUT_FILE
+                )
+            )
+
+            run(
+                input_file=archived_file,
+                input_mtime=original_mtime,
+            )
+
+            logger.info(
+                "Ciclo completado correctamente. "
+                "Esperando nuevo archivo..."
+            )
+
+        except KeyboardInterrupt:
+            logger.info(
+                "Watcher detenido manualmente por el usuario."
+            )
+
+            print()
+            print(
+                "Proceso detenido manualmente."
+            )
+
+            break
+
+        except Exception:
+            logger.exception(
+                "El ciclo actual terminó con error. "
+                "El watcher continuará activo."
+            )
+
+            print()
+            print(
+                "Ocurrió un error en el ciclo actual."
+            )
+            print(
+                f"Revisa el log: {LOG_FILE}"
+            )
+            print(
+                "El watcher continuará esperando nuevos archivos."
+            )
+            print()
+
+        time.sleep(
+            CHECK_INTERVAL_SECONDS
+        )
+
+
+# ============================================================
+# 24. EJECUCIÓN
 # ============================================================
 if __name__ == "__main__":
-    run()
+    watch()
